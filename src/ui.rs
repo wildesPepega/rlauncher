@@ -61,6 +61,8 @@ pub struct Launcher {
     cursor_to_end: bool,
     /// Only select items on hover after the pointer actually moved.
     last_pointer: Option<Pos2>,
+    /// The user moved the selection (keys/mouse) since the query last changed.
+    manual_selection: bool,
 
     icons: HashMap<String, IconState>,
     loader: IconLoader,
@@ -90,6 +92,7 @@ impl Launcher {
             scroll: 0,
             cursor_to_end: false,
             last_pointer: None,
+            manual_selection: false,
             icons: HashMap::new(),
             loader: IconLoader::spawn(icon_done),
             events: Vec::new(),
@@ -187,6 +190,22 @@ impl Launcher {
     }
 
     pub fn set_apps(&mut self, apps: Vec<App>) {
+        let known: std::collections::HashSet<&str> = self.apps.iter().map(|a| a.id.as_str()).collect();
+        let first_scan = self.apps.is_empty();
+        let mut retry = Vec::new();
+        for app in &apps {
+            if let Some(icon) = &app.icon {
+                // New apps get another chance for icons that were missing before.
+                if !first_scan && !known.contains(app.id.as_str()) {
+                    retry.push(icon.clone());
+                }
+            }
+        }
+        for icon in retry {
+            if matches!(self.icons.get(&icon), Some(IconState::Missing)) {
+                self.icons.remove(&icon);
+            }
+        }
         for app in &apps {
             if let Some(icon) = &app.icon {
                 self.request_icon(icon);
@@ -269,10 +288,18 @@ impl Launcher {
             stats: &self.stats,
             config: &self.config,
         };
+        let previous = self.results.get(self.selected).map(|r| r.key.clone());
         self.results = search::search(&self.query, &ctx);
-        if reset_selection || self.selected >= self.results.len() {
+        if reset_selection || !self.manual_selection {
+            // the best match stays selected, also when apps appear while typing
             self.selected = 0;
             self.scroll = 0;
+            self.manual_selection = false;
+        } else {
+            // the user picked something: keep it selected when the list changes underneath
+            self.selected = previous
+                .and_then(|k| self.results.iter().position(|r| r.key == k))
+                .unwrap_or(0);
         }
         self.ensure_visible();
     }
@@ -294,6 +321,9 @@ impl Launcher {
 
     pub fn nav(&mut self, key: NavKey) {
         let n = self.results.len();
+        if matches!(key, NavKey::Up | NavKey::Down | NavKey::PageUp | NavKey::PageDown) {
+            self.manual_selection = true;
+        }
         match key {
             NavKey::Escape => self.events.push(UiEvent::Hide),
             NavKey::Up if n > 0 => self.selected = (self.selected + n - 1) % n,
@@ -313,7 +343,10 @@ impl Launcher {
                 });
                 match completion {
                     Some(q) => self.set_query(q),
-                    None if n > 0 => self.selected = (self.selected + 1) % n,
+                    None if n > 0 => {
+                        self.selected = (self.selected + 1) % n;
+                        self.manual_selection = true;
+                    }
                     None => {}
                 }
             }
@@ -535,6 +568,7 @@ impl Launcher {
             let resp = ui.interact(row, ui.scope_id().with(("row", i)), Sense::click());
             if resp.hovered() && pointer_moved {
                 self.selected = i;
+                self.manual_selection = true;
             }
             if resp.clicked() {
                 clicked = Some(i);

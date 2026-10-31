@@ -81,6 +81,154 @@ pub fn scan(blacklist: &[String]) -> Vec<App> {
     apps
 }
 
+/// Watches all application folders with inotify and calls `on_change` (from a background
+/// thread) as soon as a desktop entry is added, changed or removed. Bursts of events, like
+/// a package manager installing many files, are coalesced into one call.
+pub fn watch(on_change: impl Fn() + Send + 'static) {
+    std::thread::Builder::new()
+        .name("rlauncher-appwatch".into())
+        .spawn(move || {
+            if let Err(e) = watch_loop(&on_change) {
+                log::warn!("cannot watch application folders, the app list updates when the launcher opens: {e}");
+            }
+        })
+        .expect("spawn app watcher");
+}
+
+/// What an inotify watch descriptor stands for. One folder can be both, and the parent of
+/// several missing folders (e.g. ~/.local/share for `applications` and `flatpak`).
+#[derive(Default)]
+struct Watched {
+    /// An application folder (or a subfolder of one).
+    app_dir: bool,
+    /// Missing application folders below this one; only their creation is interesting.
+    children: Vec<std::ffi::OsString>,
+}
+
+fn watch_loop(on_change: &dyn Fn()) -> std::io::Result<()> {
+    use std::collections::HashMap;
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: plain syscalls on a file descriptor owned by this function.
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    const MASK: u32 = libc::IN_CREATE
+        | libc::IN_DELETE
+        | libc::IN_CLOSE_WRITE
+        | libc::IN_MOVED_FROM
+        | libc::IN_MOVED_TO
+        | libc::IN_ATTRIB
+        | libc::IN_DELETE_SELF
+        | libc::IN_MOVE_SELF;
+
+    // Watching the same path again returns the same descriptor, so masks are combined
+    // (IN_MASK_ADD) and the bookkeeping is merged.
+    let add = |path: &Path, child: Option<&std::ffi::OsStr>, map: &mut HashMap<i32, Watched>| {
+        let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return };
+        let mask = if child.is_some() { libc::IN_CREATE | libc::IN_MOVED_TO } else { MASK };
+        let wd = unsafe { libc::inotify_add_watch(fd, c.as_ptr(), mask | libc::IN_MASK_ADD) };
+        if wd >= 0 {
+            let w = map.entry(wd).or_default();
+            match child {
+                Some(name) => w.children.push(name.to_os_string()),
+                None => w.app_dir = true,
+            }
+        }
+    };
+
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut old_map: HashMap<i32, Watched> = HashMap::new();
+    let mut first = true;
+    loop {
+        // (Re)build the watch list: folders may have been created or removed. Watching a
+        // path twice returns the same descriptor, so existing watches stay active.
+        let mut map: HashMap<i32, Watched> = HashMap::new();
+        for dir in application_dirs() {
+            if dir.is_dir() {
+                let mut dirs = vec![dir];
+                while let Some(d) = dirs.pop() {
+                    add(&d, None, &mut map);
+                    if let Ok(entries) = std::fs::read_dir(&d) {
+                        dirs.extend(entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+                    }
+                }
+            } else {
+                let mut child = dir.as_path();
+                while let Some(parent) = child.parent() {
+                    if parent.is_dir() {
+                        if let Some(name) = child.file_name() {
+                            add(parent, Some(name), &mut map);
+                        }
+                        break;
+                    }
+                    child = parent;
+                }
+            }
+        }
+
+        log::debug!("watching {} application folders", map.len());
+        for wd in old_map.keys().filter(|wd| !map.contains_key(wd)) {
+            unsafe { libc::inotify_rm_watch(fd, *wd) };
+        }
+        // Rescan only after the watches are in place, so no change can slip through.
+        if !first {
+            on_change();
+        }
+        first = false;
+
+        // Wait for a relevant event.
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                unsafe { libc::close(fd) };
+                return Err(err);
+            }
+            if events_relevant(&buf[..n as usize], &map) {
+                break;
+            }
+        }
+        // Coalesce the rest of the burst: wait until nothing happened for 80 ms.
+        loop {
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            if unsafe { libc::poll(&mut pfd, 1, 80) } <= 0 {
+                break;
+            }
+            if unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } <= 0 {
+                break;
+            }
+        }
+        old_map = map;
+    }
+
+    fn events_relevant(mut data: &[u8], map: &HashMap<i32, Watched>) -> bool {
+        const HEADER: usize = std::mem::size_of::<libc::inotify_event>();
+        let mut relevant = false;
+        while data.len() >= HEADER {
+            // SAFETY: the kernel writes whole, aligned-enough events; read_unaligned is used anyway.
+            let ev: libc::inotify_event = unsafe { std::ptr::read_unaligned(data.as_ptr().cast()) };
+            let name_end = HEADER + ev.len as usize;
+            let name = data.get(HEADER..name_end).unwrap_or(&[]);
+            let name = &name[..name.iter().position(|b| *b == 0).unwrap_or(name.len())];
+            data = data.get(name_end..).unwrap_or(&[]);
+
+            let is_dir = ev.mask & libc::IN_ISDIR != 0;
+            let self_event = ev.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_Q_OVERFLOW) != 0;
+            relevant |= self_event
+                || map.get(&ev.wd).is_some_and(|w| {
+                    (w.app_dir && (is_dir || name.ends_with(b".desktop")))
+                        || w.children.iter().any(|c| c.as_bytes() == name)
+                });
+        }
+        relevant
+    }
+}
+
 fn collect_desktop_files(
     root: &Path,
     dir: &Path,
@@ -490,6 +638,32 @@ mod tests {
             exec_name: "x".into(),
         };
         assert_eq!(app_argv(&app), vec!["x", "--name=X", "--pct", "100%"]);
+    }
+
+    #[test]
+    fn watcher_sees_new_desktop_files() {
+        let dir = std::env::temp_dir().join(format!("rlauncher-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: no other test reads these variables.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_DATA_DIRS", dir.join("none"));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        watch(move || {
+            let _ = tx.send(());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let apps = dir.join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(apps.join("x.desktop"), "[Desktop Entry]\nName=X\nExec=x\n").unwrap();
+        let t = std::time::Instant::now();
+        rx.recv_timeout(std::time::Duration::from_secs(2)).expect("no change notification");
+        eprintln!("notified after {:?}", t.elapsed());
+        std::fs::remove_file(apps.join("x.desktop")).unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(2)).expect("no notification for removal");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

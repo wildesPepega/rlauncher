@@ -63,9 +63,12 @@ use crate::ui::{Launcher, NavKey, UiEvent};
 pub enum Msg {
     Command(Command, Option<String>),
     Icon(LoadedIcon),
-    Apps(Vec<App>),
+    /// Result of an app scan, tagged with the scan's sequence number.
+    Apps(u64, Vec<App>),
     /// Something shown in the window changed in a background thread.
     Redraw,
+    /// A desktop entry was added, changed or removed.
+    AppsChanged,
 }
 
 /// Wrapper so wgpu can open the EGL/Vulkan display for our Wayland connection.
@@ -157,6 +160,8 @@ pub struct State {
     launcher: Launcher,
     msg_tx: Sender<Msg>,
     hotkey: crate::hotkey::Hotkey,
+    scan_seq: u64,
+    applied_scan: u64,
     pending_launch: Option<PendingLaunch>,
     /// Debounces toggle commands that arrive twice (e.g. portal + compositor binding).
     last_toggle: Option<Instant>,
@@ -269,12 +274,19 @@ pub fn run(listener: UnixListener, show_on_start: bool) -> anyhow::Result<()> {
         launcher,
         msg_tx,
         hotkey,
+        scan_seq: 0,
+        applied_scan: 0,
         pending_launch: None,
         last_toggle: None,
         exit: false,
     };
     state.launcher.setup(&state.egui_ctx);
     state.rescan_apps();
+    // Live updates of the app list while running (and while the launcher is open).
+    let tx = state.msg_tx.clone();
+    apps::watch(move || {
+        let _ = tx.send(Msg::AppsChanged);
+    });
 
     if show_on_start {
         state.show();
@@ -307,11 +319,19 @@ impl State {
                 self.launcher.icon_loaded(icon);
                 self.redraw = self.window.is_some();
             }
-            Msg::Apps(apps) => {
-                self.launcher.set_apps(apps);
-                self.redraw = self.window.is_some();
+            Msg::Apps(seq, apps) => {
+                // scans run in parallel threads: never let an older one win
+                if seq > self.applied_scan {
+                    self.applied_scan = seq;
+                    self.launcher.set_apps(apps);
+                    self.redraw = self.window.is_some();
+                }
             }
             Msg::Redraw => self.redraw = self.window.is_some(),
+            Msg::AppsChanged => {
+                log::debug!("application folders changed, rescanning");
+                self.rescan_apps();
+            }
         }
     }
 
@@ -354,13 +374,15 @@ impl State {
         }
     }
 
-    fn rescan_apps(&self) {
+    fn rescan_apps(&mut self) {
+        self.scan_seq += 1;
+        let seq = self.scan_seq;
         let tx = self.msg_tx.clone();
         let blacklist = self.launcher.config.blacklisted_dirs.clone();
         std::thread::spawn(move || {
             let apps = apps::scan(&blacklist);
             log::debug!("found {} applications", apps.len());
-            let _ = tx.send(Msg::Apps(apps));
+            let _ = tx.send(Msg::Apps(seq, apps));
         });
     }
 

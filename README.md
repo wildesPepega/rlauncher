@@ -11,6 +11,7 @@ Press a hotkey, type a few letters, hit Enter. rlauncher shows up in the middle 
 ## Features
 
 - **App search**: finds every installed app (`.desktop` files, including Flatpak), with fuzzy matching ranked like Ulauncher and localized names. Apps you pick often move up.
+- **Live app list**: the app folders are watched with inotify, so installed, renamed or removed apps show up within about 100 ms, even while the launcher is open.
 - **Custom queries** (Ulauncher "shortcuts"): type `re` → *Reboot*, `g cats` → Google search for "cats". A query can run a command, a shell script (`#!/bin/sh …`) or open a URL. The `%s` placeholder takes the argument.
 - **Ulauncher themes**: drop-in support for Ulauncher's `manifest.json` + GTK CSS themes, including `extend_theme`, `@define-color`, `alpha()`, `shade()` and `mix()`. Themes in `~/.config/ulauncher/user-themes` are picked up automatically.
 - **Settings UI** behind the gear icon: hotkey recorder, autostart, query editor, and a theme picker with live preview.
@@ -175,7 +176,7 @@ jump_keys = "1234567890abcdefghijklmnopqrstuvwxyz"
 - The UI is rendered with **egui + wgpu** (Vulkan or GLES). Input goes through smithay-client-toolkit with xkbcommon (key repeat, compose and layouts). Fractional scaling uses `wp_fractional_scale_v1` + `wp_viewporter`.
 - Before an app is started, rlauncher requests an **XDG activation token** from the compositor and passes it on as `XDG_ACTIVATION_TOKEN`, so the new window is allowed to take focus.
 - The **hotkey** is registered with KDE's kglobalaccel over D-Bus when it is available. Otherwise the XDG GlobalShortcuts portal is used.
-- **Apps** are read from all `applications/` folders in `XDG_DATA_DIRS` in a background thread every time the launcher opens. **Icons** are resolved from your icon theme (KDE, GNOME or GTK setting, with inheritance) and rasterized in a background thread (SVG via resvg).
+- **Apps** are read from all `applications/` folders in `XDG_DATA_DIRS` in a background thread. An inotify watcher on those folders (and on the parents of folders that don't exist yet) triggers a rescan within about 100 ms of any change; bursts of events, such as a package install, are coalesced into one rescan. **Icons** are resolved from your icon theme (KDE, GNOME or GTK setting, with inheritance) and rasterized in a background thread (SVG via resvg).
 - **Ranking** uses Ulauncher's algorithm (Levenshtein-based score with word-start boosts), filtered to plausible matches and boosted by how often and for which query you picked an item.
 
 ## Not supported (yet)

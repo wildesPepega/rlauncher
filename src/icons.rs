@@ -26,9 +26,17 @@ impl IconLoader {
         std::thread::Builder::new()
             .name("rlauncher-icons".into())
             .spawn(move || {
-                let index = IconIndex::build();
+                let mut index = IconIndex::build();
+                let mut built = std::time::Instant::now();
                 for spec in rx {
-                    let image = index.resolve(&spec).and_then(|p| load_image(&p, ICON_PX));
+                    let mut path = index.resolve(&spec);
+                    // A freshly installed app may bring icons the index doesn't know yet.
+                    if path.is_none() && built.elapsed() > std::time::Duration::from_secs(3) {
+                        index = IconIndex::build();
+                        built = std::time::Instant::now();
+                        path = index.resolve(&spec);
+                    }
+                    let image = path.and_then(|p| load_image(&p, ICON_PX));
                     done(LoadedIcon { spec, image });
                 }
             })
