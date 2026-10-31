@@ -317,12 +317,19 @@ mod kde {
             s.can_set = true;
         });
 
-        // Respect a key the user configured in the system settings; otherwise use ours.
-        let existing = current(&kga).await;
-        if existing.is_some() || !enabled {
-            update(&|s| s.active = existing.clone());
-        } else {
+        // Respect a key that is already saved (from an earlier run or the system settings);
+        // otherwise use ours. Either way the action must be marked as present: kglobalaccel
+        // only delivers key presses to components with present actions.
+        let saved: Vec<i32> = kga.call("shortcut", &(action_id(),)).await.unwrap_or_default();
+        let saved: Vec<i32> = saved.into_iter().filter(|k| *k != 0).collect();
+        if !enabled {
+            update(&|s| s.active = None);
+        } else if saved.is_empty() {
             apply(&kga, trigger, false, false, update).await;
+        } else {
+            let keys: Vec<i32> = kga.call("setShortcut", &(action_id(), saved, SET_PRESENT)).await?;
+            let active = keys.into_iter().find(|k| *k != 0).map(qt_display);
+            update(&|s| s.active = active.clone());
         }
 
         let path: OwnedObjectPath = kga.call("getComponent", &(COMPONENT,)).await?;
