@@ -64,6 +64,8 @@ esac
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
+OUT="$TMP/out"   # finished binaries are staged here
+mkdir -p "$OUT"
 
 download() {
     arch="$(uname -m)"
@@ -91,7 +93,7 @@ download() {
         warn "the prebuilt binary does not run on this system"
         return 1
     fi
-    cp "$TMP/rlauncher/rlauncher" "$TMP/rlauncher/rlauncher-toggle" "$TMP/"
+    cp "$TMP/rlauncher/rlauncher" "$TMP/rlauncher/rlauncher-toggle" "$OUT/"
 }
 
 build() {
@@ -99,7 +101,7 @@ build() {
     if [ -f Cargo.toml ] && grep -q '^name = "rlauncher"' Cargo.toml; then
         info "Building from the local checkout"
         cargo build --release --locked
-        cp target/release/rlauncher target/release/rlauncher-toggle "$TMP/"
+        cp target/release/rlauncher target/release/rlauncher-toggle "$OUT/"
     else
         info "Building from https://github.com/$REPO (this takes a few minutes)"
         if [ "$VERSION" = latest ]; then
@@ -107,7 +109,7 @@ build() {
         else
             cargo install --locked --git "https://github.com/$REPO" --tag "$VERSION" --root "$TMP/root" rlauncher
         fi
-        cp "$TMP/root/bin/rlauncher" "$TMP/root/bin/rlauncher-toggle" "$TMP/"
+        cp "$TMP/root/bin/rlauncher" "$TMP/root/bin/rlauncher-toggle" "$OUT/"
     fi
 }
 
@@ -124,8 +126,8 @@ fi
 info "Installing to $BIN_DIR"
 "$BIN_DIR/rlauncher" quit 2>/dev/null || true
 mkdir -p "$BIN_DIR" "$APP_DIR"
-install -m755 "$TMP/rlauncher" "$BIN_DIR/rlauncher"
-install -m755 "$TMP/rlauncher-toggle" "$BIN_DIR/rlauncher-toggle"
+install -m755 "$OUT/rlauncher" "$BIN_DIR/rlauncher"
+install -m755 "$OUT/rlauncher-toggle" "$BIN_DIR/rlauncher-toggle"
 
 # Gives rlauncher an app id, needed by the XDG GlobalShortcuts portal.
 cat > "$APP_DIR/io.github.rlauncher.desktop" <<EOF
@@ -171,7 +173,7 @@ cat <<EOF
 
 rlauncher is installed.
 
-  Open it:      your hotkey (KDE: Meta+Space by default) or run rlauncher-toggle
+  Open it:      your hotkey (set it in Settings → Hotkey) or run rlauncher-toggle
   Settings:     click the gear in the search field, or run: rlauncher settings
   Other WMs:    bind "rlauncher-toggle" to a key in your compositor config
   Uninstall:    curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sh -s -- --uninstall
