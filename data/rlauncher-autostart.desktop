@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=rlauncher
+Comment=Start the rlauncher daemon
+Exec=rlauncher
+Icon=system-search
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

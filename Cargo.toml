@@ -1,0 +1,55 @@
+[package]
+name = "rlauncher"
+version = "0.1.0"
+edition = "2024"
+description = "A fast application launcher for Wayland, inspired by Ulauncher"
+license = "MIT"
+rust-version = "1.88"
+repository = "https://github.com/wildesPepega/rlauncher"
+readme = "README.md"
+keywords = ["launcher", "wayland", "egui", "ulauncher"]
+categories = ["gui"]
+
+[[bin]]
+name = "rlauncher"
+path = "src/main.rs"
+
+[[bin]]
+name = "rlauncher-toggle"
+path = "src/bin/rlauncher-toggle.rs"
+
+[features]
+default = ["portal"]
+# Global hotkey via KDE's kglobalaccel or the XDG GlobalShortcuts portal
+portal = ["dep:ashpd", "dep:tokio", "dep:futures-util", "dep:zbus"]
+
+[dependencies]
+anyhow = "1"
+dirs = "6"
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+egui-wgpu = { version = "0.37", default-features = false, features = ["wayland"] }
+wgpu = { version = "*", default-features = false, features = ["vulkan", "gles", "wgsl"] }
+env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2"
+log = "0.4"
+pollster = "0.4"
+raw-window-handle = "0.6"
+resvg = "0.45"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop", "xkbcommon"] }
+smithay-clipboard = "0.7"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+toml = "0.9"
+
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts"], optional = true }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"], optional = true }
+zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true

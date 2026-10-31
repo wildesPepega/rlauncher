@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=rlauncher
+GenericName=Application Launcher
+Comment=Fast application launcher for Wayland
+Exec=rlauncher-toggle
+Icon=system-search
+Terminal=false
+Categories=Utility;
+NoDisplay=true
