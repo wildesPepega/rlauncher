@@ -57,6 +57,19 @@ pub struct Config {
     pub font: String,
     /// Placeholder text of the input field.
     pub placeholder: String,
+    /// The monitor the launcher opens on.
+    pub monitor: Monitor,
+}
+
+/// Which monitor the launcher opens on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Monitor {
+    /// The monitor under the mouse pointer.
+    #[default]
+    Mouse,
+    /// The primary monitor (KDE's primary display, elsewhere the top-left one).
+    Primary,
 }
 
 impl Default for Config {
@@ -87,6 +100,7 @@ impl Default for Config {
             shadow: true,
             font: String::new(),
             placeholder: "Search apps, commands…".into(),
+            monitor: Monitor::Mouse,
         }
     }
 }

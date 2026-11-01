@@ -73,7 +73,14 @@ pub struct Launcher {
 }
 
 const PADDING: f32 = 12.0;
-const GEAR_SIZE: f32 = 22.0;
+/// Input row geometry, taken 1:1 from Ulauncher's window (ulauncher_window.py):
+/// the entry has 15px margin above and below, 20px left and right; the 24px
+/// preferences button follows with 15px to the window edge.
+const INPUT_MARGIN_X: f32 = 20.0;
+const INPUT_MARGIN_Y: f32 = 15.0;
+const INPUT_MIN_HEIGHT: f32 = 30.0;
+const GEAR_SIZE: f32 = 24.0;
+const GEAR_MARGIN_END: f32 = 15.0;
 const ICON_SIZE: f32 = 40.0;
 
 impl Launcher {
@@ -401,13 +408,15 @@ impl Launcher {
             .fixed_pos(origin)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                frame.show(ui, |ui| {
-                    let inner_width = width - 2.0 * PADDING - 2.0 * t.border_width;
+                frame.inner_margin(egui::Margin::ZERO).show(ui, |ui| {
+                    let inner_width = width - 2.0 * t.border_width;
                     ui.set_width(inner_width);
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     self.input_ui(ui, &t);
                     if !self.results.is_empty() {
-                        ui.add_space(PADDING * 0.8);
-                        self.results_ui(ui, &t, inner_width);
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin { left: PADDING as i8, right: PADDING as i8, top: 0, bottom: PADDING as i8 })
+                            .show(ui, |ui| self.results_ui(ui, &t, inner_width - 2.0 * PADDING));
                     }
                 });
             });
@@ -499,23 +508,44 @@ impl Launcher {
         let hint = egui::RichText::new(&self.config.placeholder)
             .font(font.clone())
             .color(t.input_color.gamma_multiply(0.45));
+        let [pad_t, pad_r, pad_b, pad_l] = t.input_padding;
+        let row_h = ui.fonts_mut(|f| f.row_height(&font));
+        // GTK centers the text when the entry is taller than its content
+        let extra = (INPUT_MIN_HEIGHT - (row_h + pad_t + pad_b)).max(0.0) / 2.0;
+        let margin = egui::Margin {
+            left: pad_l.round() as i8,
+            right: pad_r.round() as i8,
+            top: (pad_t + extra).round() as i8,
+            bottom: (pad_b + extra).round() as i8,
+        };
+        let edit_width = ui.available_width() - 2.0 * INPUT_MARGIN_X - GEAR_SIZE - GEAR_MARGIN_END;
         let edit = egui::TextEdit::singleline(&mut self.query)
             .id(id)
             .font(font)
             .text_color(t.input_color)
             .hint_text(hint)
             .frame(egui::Frame::NONE)
-            .margin(egui::Margin::symmetric(6, 9))
-            .desired_width(ui.available_width() - GEAR_SIZE - 10.0);
-        let row = ui.horizontal(|ui| {
-            let output = edit.show(ui);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if gear_button(ui, t).clicked() {
-                    self.events.push(UiEvent::OpenSettings);
-                }
+            .margin(margin)
+            .desired_width(edit_width - pad_l - pad_r);
+        let row = egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: INPUT_MARGIN_X as i8,
+                right: GEAR_MARGIN_END as i8,
+                top: INPUT_MARGIN_Y as i8,
+                bottom: INPUT_MARGIN_Y as i8,
+            })
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let output = edit.show(ui);
+                    ui.add_space(INPUT_MARGIN_X);
+                    if gear_button(ui, t).clicked() {
+                        self.events.push(UiEvent::OpenSettings);
+                    }
+                    output
+                })
+                .inner
             });
-            output
-        });
         let mut output = row.inner;
         if self.cursor_to_end {
             self.cursor_to_end = false;
@@ -677,8 +707,8 @@ fn gear_button(ui: &mut egui::Ui, t: &Theme) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(GEAR_SIZE), Sense::click());
     // deliberately subtle: dim until hovered
     let color = if resp.hovered() { t.hl_selected } else { t.item_text.gamma_multiply(0.35) };
-    paint_gear(ui.painter(), rect.center(), GEAR_SIZE * 0.32, color);
-    resp.on_hover_text("Einstellungen")
+    paint_gear(ui.painter(), rect.center(), 7.0, color);
+    resp.on_hover_text("Settings")
 }
 
 fn paint_gear(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32) {

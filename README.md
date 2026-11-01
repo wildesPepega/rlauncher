@@ -15,6 +15,7 @@ Press a hotkey, type a few letters, hit Enter. rlauncher shows up in the middle 
 - **Custom queries** (Ulauncher "shortcuts"): type `re` → *Reboot*, `g cats` → Google search for "cats". A query can run a command, a shell script (`#!/bin/sh …`) or open a URL. The `%s` placeholder takes the argument.
 - **Ulauncher themes**: drop-in support for Ulauncher's `manifest.json` + GTK CSS themes, including `extend_theme`, `@define-color`, `alpha()`, `shade()` and `mix()`. Themes in `~/.config/ulauncher/user-themes` are picked up automatically.
 - **Settings UI** behind the gear icon: hotkey recorder, autostart, query editor, and a theme picker with live preview.
+- **Multi-monitor**: opens on the monitor with the mouse pointer, or always on the primary monitor (*Settings → General → Open on*).
 - **Calculator**: `2*(3+4)`, `sqrt(2)^2`, `sin(pi/2)`. Enter copies the result.
 - **File browser**: queries starting with `/` or `~` list files. Enter opens a file, Tab completes a folder.
 - **Native Wayland**: wlr-layer-shell overlay, fractional scaling, and XDG activation, so launched apps really get focus. Clipboard support.
@@ -25,8 +26,6 @@ Press a hotkey, type a few letters, hit Enter. rlauncher shows up in the middle 
 | Custom queries | Theme picker |
 |---|---|
 | <img src="docs/settings-queries.png" alt="Query editor"> | <img src="docs/settings-themes.png" alt="Theme picker"> |
-
-> The settings UI is currently in German.
 
 ## Compatibility
 
@@ -158,6 +157,7 @@ theme_dirs = []            # extra theme folders
 width = 600.0              # window width in logical pixels
 max_results = 8            # visible results
 top_offset = 0.22          # top edge at 22 % of the screen height
+monitor = "mouse"          # "mouse" = monitor with the pointer, "primary" = primary monitor
 terminal = ""              # for Terminal=true apps, empty = auto-detect
 close_on_focus_out = true
 hotkey_enabled = true
@@ -173,6 +173,8 @@ jump_keys = "1234567890abcdefghijklmnopqrstuvwxyz"
 
 - `rlauncher` runs as a small **daemon** that owns a control socket at `$XDG_RUNTIME_DIR/rlauncher-<display>.sock`. `rlauncher-toggle` and `rlauncher show|hide|…` only write a command to that socket. If no daemon is running, they start one.
 - When it is shown, the daemon creates a transparent **wlr-layer-shell overlay** covering the active output, with exclusive keyboard focus. The launcher window is drawn inside that overlay, horizontally centered and placed at `top_offset` of the screen height. This gives exact positioning, which normal Wayland windows can't do. A click outside the window closes it. When hidden, the surface is destroyed and nothing is rendered.
+- **Monitor selection**: Wayland clients can't ask where the pointer is. With `monitor = "mouse"`, rlauncher briefly maps an invisible one-pixel surface (stretched with `wp_viewporter`) on every output, and the output whose surface receives `wl_pointer.enter` gets the launcher, which takes a few milliseconds. With `monitor = "primary"`, it uses KDE's output order (`kde_output_order_v1`), or the top-left output on other compositors.
+- The **input field** uses Ulauncher's exact geometry: 15 px margin above and below, 20 px at the sides, the theme's `.input` padding (default `5px 0 5px 7px`) and font size relative to the GTK font (`170%`).
 - The UI is rendered with **egui + wgpu** (Vulkan or GLES). Input goes through smithay-client-toolkit with xkbcommon (key repeat, compose and layouts). Fractional scaling uses `wp_fractional_scale_v1` + `wp_viewporter`.
 - Before an app is started, rlauncher requests an **XDG activation token** from the compositor and passes it on as `XDG_ACTIVATION_TOKEN`, so the new window is allowed to take focus.
 - The **hotkey** is registered with KDE's kglobalaccel over D-Bus when it is available. Otherwise the XDG GlobalShortcuts portal is used.
@@ -183,7 +185,6 @@ jump_keys = "1234567890abcdefghijklmnopqrstuvwxyz"
 
 - Ulauncher extensions (Python)
 - GNOME/Mutter and X11
-- Translations (the settings UI is German)
 
 ## Uninstall
 

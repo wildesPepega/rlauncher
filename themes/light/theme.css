@@ -16,7 +16,7 @@
 @define-color item_shortcut_color_sel #444;
 
 .app { background-color: @window_bg; border: 1px solid @window_border_color; border-radius: 4px; }
-.input { color: @input_color; font-size: 170%; }
+.input { color: @input_color; font-size: 170%; padding: 5px 0 5px 7px; }
 .input *:selected { background-color: alpha(@selected_bg_color, 0.9); color: @selected_fg_color; }
 .item-text { color: @item_text; }
 .item-name { color: @item_name; font-size: 120%; }

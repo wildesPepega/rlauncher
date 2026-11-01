@@ -40,13 +40,14 @@ use smithay_client_toolkit::{
             LayerSurfaceConfigure,
         },
     },
-    shm::{Shm, ShmHandler},
+    shm::{Shm, ShmHandler, raw::RawPool},
 };
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
     globals::{GlobalList, registry_queue_init},
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
+    protocol::{wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
+use wayland_protocols_plasma::output_order::v1::client::kde_output_order_v1::{self, KdeOutputOrderV1};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
     wp_fractional_scale_v1::{self, WpFractionalScaleV1},
@@ -54,7 +55,7 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
 use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
 
 use crate::apps::{self, App};
-use crate::config::APP_ID;
+use crate::config::{APP_ID, Monitor};
 use crate::icons::LoadedIcon;
 use crate::ipc::{self, Command};
 use crate::ui::{Launcher, NavKey, UiEvent};
@@ -119,6 +120,24 @@ impl Window {
     }
 }
 
+/// Invisible full-screen surfaces on every output, used to find out which output the
+/// pointer is on (Wayland clients can't query the global pointer position).
+struct Probe {
+    surfaces: Vec<ProbeSurface>,
+    _pool: RawPool,
+    timer: Option<RegistrationToken>,
+}
+
+struct ProbeSurface {
+    layer: LayerSurface,
+    output: wl_output::WlOutput,
+    viewport: WpViewport,
+    buffer: wl_buffer::WlBuffer,
+}
+
+/// How long to wait for the pointer to enter a probe surface.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(150);
+
 struct PendingLaunch {
     spec: apps::LaunchSpec,
     started: Instant,
@@ -148,6 +167,11 @@ pub struct State {
     instance: wgpu::Instance,
     gpu: Option<Gpu>,
     window: Option<Window>,
+    probe: Option<Probe>,
+    /// KDE's output order (first = primary), from kde_output_order_v1.
+    _output_order_global: Option<KdeOutputOrderV1>,
+    output_order: Vec<String>,
+    output_order_pending: Vec<String>,
 
     egui_ctx: egui::Context,
     egui_events: Vec<egui::Event>,
@@ -187,6 +211,7 @@ pub fn run(listener: UnixListener, show_on_start: bool) -> anyhow::Result<()> {
     let activation = ActivationState::bind(&globals, &qh).ok();
     let fractional_manager = bind_optional::<WpFractionalScaleManagerV1>(&globals, &qh);
     let viewporter = bind_optional::<WpViewporter>(&globals, &qh);
+    let output_order_global = bind_optional::<KdeOutputOrderV1>(&globals, &qh);
 
     let display_ptr = NonNull::new(conn.backend().display_ptr() as *mut std::ffi::c_void)
         .context("null wayland display")?;
@@ -264,6 +289,10 @@ pub fn run(listener: UnixListener, show_on_start: bool) -> anyhow::Result<()> {
         instance,
         gpu: None,
         window: None,
+        probe: None,
+        _output_order_global: output_order_global,
+        output_order: Vec::new(),
+        output_order_pending: Vec::new(),
         egui_ctx,
         egui_events: Vec::new(),
         start_time: Instant::now(),
@@ -344,7 +373,7 @@ impl State {
                     return;
                 }
                 self.last_toggle = Some(Instant::now());
-                if self.window.is_some() {
+                if self.window.is_some() || self.probe.is_some() {
                     self.hide();
                 } else {
                     self.show();
@@ -387,13 +416,118 @@ impl State {
     }
 
     fn show(&mut self) {
-        if self.window.is_some() {
+        if self.window.is_some() || self.probe.is_some() {
             return;
         }
         self.launcher.reload(&self.egui_ctx);
         self.launcher.reset();
         self.rescan_apps();
 
+        match self.launcher.config.monitor {
+            Monitor::Primary => {
+                let output = self.primary_output();
+                self.create_window(output.as_ref());
+            }
+            Monitor::Mouse => {
+                if !self.start_probe() {
+                    self.create_window(None);
+                }
+            }
+        }
+    }
+
+    /// The primary output: first in KDE's output order, otherwise the top-left one.
+    /// `None` when there is only one output (the compositor's choice is then the same).
+    fn primary_output(&self) -> Option<wl_output::WlOutput> {
+        let outputs: Vec<_> = self.output_state.outputs().collect();
+        if outputs.len() <= 1 {
+            return None;
+        }
+        let infos: Vec<_> = outputs.iter().map(|o| self.output_state.info(o)).collect();
+        for name in &self.output_order {
+            if let Some(i) = infos.iter().position(|i| i.as_ref().and_then(|i| i.name.as_ref()) == Some(name)) {
+                return Some(outputs[i].clone());
+            }
+        }
+        outputs
+            .iter()
+            .zip(&infos)
+            .min_by_key(|(_, info)| {
+                let (x, y) = info.as_ref().map(|i| i.logical_position.unwrap_or(i.location)).unwrap_or((i32::MAX / 4, 0));
+                (y.max(0) + x.max(0), y, x)
+            })
+            .map(|(o, _)| o.clone())
+    }
+
+    /// Maps an invisible surface on every output; the pointer entering one of them tells
+    /// where the launcher has to go. Returns false if probing is not possible or needed.
+    fn start_probe(&mut self) -> bool {
+        let outputs: Vec<_> = self.output_state.outputs().collect();
+        let Some(viewporter) = self.viewporter.clone() else { return false };
+        if outputs.len() <= 1 || self.pointer.is_none() {
+            return false;
+        }
+        let Ok(mut pool) = RawPool::new(4, &self.shm) else { return false };
+        let mut surfaces = Vec::new();
+        for output in outputs {
+            let surface = self.compositor.create_surface(&self.qh);
+            let viewport = viewporter.get_viewport(&surface, &self.qh, ());
+            let layer = self.layer_shell.create_layer_surface(
+                &self.qh,
+                surface,
+                Layer::Overlay,
+                Some("rlauncher-probe"),
+                Some(&output),
+            );
+            layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+            layer.set_exclusive_zone(-1);
+            layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+            layer.set_size(0, 0);
+            layer.commit();
+            // a single fully transparent pixel, stretched over the output by the viewport
+            let buffer = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, (), &self.qh);
+            surfaces.push(ProbeSurface { layer, output, viewport, buffer });
+        }
+        let timer = self
+            .loop_handle
+            .insert_source(Timer::from_duration(PROBE_TIMEOUT), |_, _, state: &mut State| {
+                if state.probe.is_some() {
+                    log::debug!("pointer not found on any output, letting the compositor choose");
+                    state.finish_probe(None);
+                }
+                TimeoutAction::Drop
+            })
+            .ok();
+        self.probe = Some(Probe { surfaces, _pool: pool, timer });
+        let _ = self.conn.flush();
+        true
+    }
+
+    /// Removes the probe surfaces and opens the launcher on `output`.
+    fn finish_probe(&mut self, output: Option<wl_output::WlOutput>) {
+        if self.cancel_probe() {
+            self.create_window(output.as_ref());
+        }
+    }
+
+    fn cancel_probe(&mut self) -> bool {
+        let Some(probe) = self.probe.take() else { return false };
+        if let Some(t) = probe.timer {
+            self.loop_handle.remove(t);
+        }
+        for p in probe.surfaces {
+            p.viewport.destroy();
+            drop(p.layer);
+            p.buffer.destroy();
+        }
+        let _ = self.conn.flush();
+        true
+    }
+
+    fn create_window(&mut self, output: Option<&wl_output::WlOutput>) {
+        if let Some(o) = output {
+            log::debug!("opening on output {:?}", self.output_state.info(o).and_then(|i| i.name));
+        }
         let surface = self.compositor.create_surface(&self.qh);
         let fractional = self
             .fractional_manager
@@ -402,7 +536,7 @@ impl State {
         let viewport = self.viewporter.as_ref().map(|v| v.get_viewport(&surface, &self.qh, ()));
         let layer =
             self.layer_shell
-                .create_layer_surface(&self.qh, surface, Layer::Overlay, Some("rlauncher"), None);
+                .create_layer_surface(&self.qh, surface, Layer::Overlay, Some("rlauncher"), output);
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
@@ -427,6 +561,7 @@ impl State {
     }
 
     fn hide(&mut self) {
+        self.cancel_probe();
         if self.window.is_some() {
             for cmd in self.launcher.on_hide(&self.egui_ctx) {
                 self.hotkey.send(cmd);
@@ -898,8 +1033,10 @@ impl OutputHandler for State {
 }
 
 impl LayerShellHandler for State {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.hide();
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        if self.window.as_ref().is_some_and(|w| &w.layer == layer) {
+            self.hide();
+        }
     }
 
     fn configure(
@@ -910,6 +1047,17 @@ impl LayerShellHandler for State {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        if let Some(probe) = &self.probe
+            && let Some(p) = probe.surfaces.iter().find(|p| &p.layer == layer)
+        {
+            let (w, h) = configure.new_size;
+            p.viewport.set_destination(w.max(1) as i32, h.max(1) as i32);
+            let surface = p.layer.wl_surface();
+            surface.attach(Some(&p.buffer), 0, 0);
+            surface.damage(0, 0, i32::MAX, i32::MAX);
+            surface.commit();
+            return;
+        }
         let Some(win) = self.window.as_mut() else { return };
         if &win.layer != layer {
             return;
@@ -1066,6 +1214,21 @@ impl KeyboardHandler for State {
 impl PointerHandler for State {
     fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
         let mods = egui_modifiers(&self.modifiers);
+        if let Some(probe) = &self.probe {
+            let hit = events.iter().find_map(|e| {
+                if !matches!(e.kind, PointerEventKind::Enter { .. }) {
+                    return None;
+                }
+                probe.surfaces.iter().find(|p| p.layer.wl_surface() == &e.surface).map(|p| p.output.clone())
+            });
+            if let Some(output) = hit {
+                if let Some(p) = &self.pointer {
+                    let _ = p.set_cursor(&self.conn, CursorIcon::Default);
+                }
+                self.finish_probe(Some(output));
+            }
+            return;
+        }
         for event in events {
             if !self.is_our_surface(&event.surface) {
                 continue;
@@ -1167,6 +1330,30 @@ impl Dispatch<WpFractionalScaleV1, wl_surface::WlSurface> for State {
             && state.is_our_surface(surface)
         {
             state.set_scale(scale as f64 / 120.0, 1);
+        }
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, ()> for State {
+    fn event(_: &mut Self, _: &wl_buffer::WlBuffer, _: wl_buffer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<KdeOutputOrderV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &KdeOutputOrderV1,
+        event: kde_output_order_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            kde_output_order_v1::Event::Output { output_name } => state.output_order_pending.push(output_name),
+            kde_output_order_v1::Event::Done => {
+                state.output_order = std::mem::take(&mut state.output_order_pending);
+                log::debug!("output order: {:?}", state.output_order);
+            }
+            _ => {}
         }
     }
 }

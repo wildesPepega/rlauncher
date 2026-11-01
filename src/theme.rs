@@ -29,6 +29,8 @@ pub struct Theme {
     pub selection_bg: Color32,
     pub selection_fg: Color32,
     pub input_size: f32,
+    /// Padding inside the input field: top, right, bottom, left.
+    pub input_padding: [f32; 4],
 
     pub item_name: Color32,
     pub item_text: Color32,
@@ -47,6 +49,53 @@ pub struct Theme {
 
 /// Base font size in logical pixels that percentages / rem / em are relative to.
 const BASE_FONT: f32 = 15.0;
+
+/// The GTK default font size in pixels. Ulauncher's input font (`font-size: 170%`) is
+/// relative to it, so the input field matches Ulauncher exactly.
+fn gtk_font_px() -> f32 {
+    static SIZE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let from_name = |name: &str| -> Option<f32> {
+            let pt: f32 = name.trim().trim_matches(['\'', '"']).rsplit([' ', ',']).next()?.parse().ok()?;
+            (4.0..=40.0).contains(&pt).then_some(pt * 96.0 / 72.0)
+        };
+        let cfg = dirs::config_dir().unwrap_or_default();
+        for file in ["gtk-3.0/settings.ini", "gtk-4.0/settings.ini"] {
+            if let Ok(text) = std::fs::read_to_string(cfg.join(file)) {
+                for line in text.lines() {
+                    if let Some(v) = line.trim().strip_prefix("gtk-font-name")
+                        && let Some(px) = from_name(v.trim_start_matches([' ', '=']))
+                    {
+                        return px;
+                    }
+                }
+            }
+        }
+        if let Ok(out) = std::process::Command::new("gsettings")
+            .args(["get", "org.gnome.desktop.interface", "font-name"])
+            .stderr(std::process::Stdio::null())
+            .output()
+            && out.status.success()
+            && let Some(px) = from_name(&String::from_utf8_lossy(&out.stdout))
+        {
+            return px;
+        }
+        // GTK's default: 11pt
+        11.0 * 96.0 / 72.0
+    })
+}
+
+/// CSS box shorthand (`5px`, `5px 7px`, `5px 0 5px 7px`, …) as [top, right, bottom, left].
+fn parse_box(v: &str) -> Option<[f32; 4]> {
+    let n: Vec<f32> = v.split_whitespace().map(|p| parse_length(p, BASE_FONT)).collect::<Option<_>>()?;
+    Some(match n.as_slice() {
+        [a] => [*a; 4],
+        [a, b] => [*a, *b, *a, *b],
+        [a, b, c] => [*a, *b, *c, *b],
+        [a, b, c, d] => [*a, *b, *c, *d],
+        _ => return None,
+    })
+}
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
@@ -589,8 +638,9 @@ impl Theme {
             .unwrap_or(input_color);
         let input_size = css
             .prop(".input", "font-size")
-            .and_then(|v| parse_length(v, BASE_FONT))
-            .unwrap_or(BASE_FONT * 1.7);
+            .and_then(|v| parse_length(v, gtk_font_px()))
+            .unwrap_or(gtk_font_px() * 1.7);
+        let input_padding = css.prop(".input", "padding").and_then(parse_box).unwrap_or([5.0, 0.0, 5.0, 7.0]);
         let selection_bg = css
             .color(".input *:selected", "background-color")
             .or_else(|| css.color("*:selected:focus", "background-color"))
@@ -645,6 +695,7 @@ impl Theme {
             selection_bg,
             selection_fg,
             input_size,
+            input_padding,
             item_name,
             item_text,
             item_name_selected,

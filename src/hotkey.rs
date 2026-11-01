@@ -375,7 +375,7 @@ mod kde {
             return;
         }
         let Some(code) = to_qt(trigger) else {
-            update(&|s| s.error = Some(format!("Unbekannte Taste: {trigger}")));
+            update(&|s| s.error = Some(format!("Unknown key: {trigger}")));
             return;
         };
 
@@ -411,7 +411,7 @@ mod kde {
                 update(&|s| {
                     s.active = active.clone();
                     if failed {
-                        s.error = Some("KDE hat das Tastenkürzel abgelehnt".into());
+                        s.error = Some("KDE rejected the shortcut".into());
                     }
                 });
             }

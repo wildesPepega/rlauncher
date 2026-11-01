@@ -110,13 +110,13 @@ impl Settings {
 
         // Header: title, tabs, close button
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Einstellungen").font(FontId::proportional(t.name_size * 1.1)).color(t.item_name));
+            ui.label(RichText::new("Settings").font(FontId::proportional(t.name_size * 1.1)).color(t.item_name));
             ui.add_space(16.0);
             for (tab, label) in [
-                (Tab::General, "Allgemein"),
+                (Tab::General, "General"),
                 (Tab::Hotkey, "Hotkey"),
                 (Tab::Queries, "Queries"),
-                (Tab::Appearance, "Aussehen"),
+                (Tab::Appearance, "Appearance"),
             ] {
                 let text = RichText::new(label).size(t.descr_size * 1.25);
                 if ui.selectable_label(self.tab == tab, text).clicked() {
@@ -128,7 +128,7 @@ impl Settings {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(RichText::new("Fertig").size(t.descr_size * 1.25)).clicked() {
+                if ui.button(RichText::new("Done").size(t.descr_size * 1.25)).clicked() {
                     actions.push(SettingsAction::Close);
                 }
             });
@@ -156,33 +156,39 @@ impl Settings {
     fn general_ui(&mut self, ui: &mut egui::Ui, t: &Theme) {
         let c = &mut self.config;
         section(ui, t, "Start");
-        ui.checkbox(&mut self.autostart, "Beim Login automatisch starten");
-        ui.checkbox(&mut c.close_on_focus_out, "Schließen, wenn das Fenster den Fokus verliert oder daneben geklickt wird");
+        ui.checkbox(&mut self.autostart, "Start automatically on login");
+        ui.checkbox(&mut c.close_on_focus_out, "Close when the window loses focus or on a click outside");
 
-        section(ui, t, "Suche");
-        ui.checkbox(&mut c.calculator, "Rechner (z. B. 2*(3+4) oder sqrt(2))");
-        ui.checkbox(&mut c.file_browser, "Dateibrowser für Eingaben, die mit / oder ~ beginnen");
+        section(ui, t, "Search");
+        ui.checkbox(&mut c.calculator, "Calculator (e.g. 2*(3+4) or sqrt(2))");
+        ui.checkbox(&mut c.file_browser, "File browser for input starting with / or ~");
         egui::Grid::new("general-grid").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
-            ui.label("Sichtbare Ergebnisse");
+            ui.label("Visible results");
             ui.add(egui::Slider::new(&mut c.max_results, 3..=15));
             ui.end_row();
-            ui.label("Schnellwahl-Tasten (Alt+…)");
+            ui.label("Quick select keys (Alt+…)");
             ui.add(egui::TextEdit::singleline(&mut c.jump_keys).desired_width(320.0));
             ui.end_row();
-            ui.label("Platzhaltertext");
+            ui.label("Placeholder text");
             ui.add(egui::TextEdit::singleline(&mut c.placeholder).desired_width(320.0));
             ui.end_row();
-            ui.label("Terminal für Terminal-Apps");
-            ui.add(egui::TextEdit::singleline(&mut c.terminal).hint_text("automatisch (kitty, foot, alacritty, …)").desired_width(320.0));
+            ui.label("Terminal for terminal apps");
+            ui.add(egui::TextEdit::singleline(&mut c.terminal).hint_text("auto-detect (kitty, foot, alacritty, …)").desired_width(320.0));
             ui.end_row();
         });
 
-        section(ui, t, "Fenster");
+        section(ui, t, "Window");
         egui::Grid::new("window-grid").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
-            ui.label("Breite");
+            ui.label("Width");
             ui.add(egui::Slider::new(&mut c.width, 400.0..=1400.0).step_by(10.0).suffix(" px"));
             ui.end_row();
-            ui.label("Abstand von oben");
+            ui.label("Open on");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut c.monitor, config::Monitor::Mouse, "Monitor with the mouse pointer");
+                ui.radio_value(&mut c.monitor, config::Monitor::Primary, "Primary monitor");
+            });
+            ui.end_row();
+            ui.label("Distance from top");
             let mut pct = c.top_offset * 100.0;
             if ui.add(egui::Slider::new(&mut pct, 5.0..=60.0).step_by(1.0).suffix(" %")).changed() {
                 c.top_offset = pct / 100.0;
@@ -192,14 +198,14 @@ impl Settings {
     }
 
     fn hotkey_ui(&mut self, ui: &mut egui::Ui, t: &Theme, status: &HotkeyStatus, actions: &mut Vec<SettingsAction>) {
-        section(ui, t, "Globales Tastenkürzel");
+        section(ui, t, "Global shortcut");
         ui.horizontal(|ui| {
-            ui.label("Aktiv:");
-            let active = status.active.clone().unwrap_or_else(|| "keins".into());
+            ui.label("Active:");
+            let active = status.active.clone().unwrap_or_else(|| "none".into());
             ui.label(RichText::new(active).strong().size(t.name_size).color(t.hl_selected));
         });
         ui.horizontal(|ui| {
-            ui.label("Gewünscht:");
+            ui.label("Wanted:");
             ui.label(RichText::new(hotkey::display(&self.config.hotkey)).strong());
         });
 
@@ -212,19 +218,19 @@ impl Settings {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(
-                        RichText::new("Drücke jetzt die gewünschte Tastenkombination …")
+                        RichText::new("Press the key combination you want …")
                             .size(t.name_size)
                             .color(t.item_name_selected),
                     );
-                    ui.label(RichText::new("Esc bricht ab").color(t.item_text_selected));
+                    ui.label(RichText::new("Esc cancels").color(t.item_text_selected));
                 });
         } else {
             ui.horizontal(|ui| {
-                if ui.add_enabled(status.can_set || status.backend.contains("Portal"), egui::Button::new("Neues Tastenkürzel aufnehmen …")).clicked() {
+                if ui.add_enabled(status.can_set || status.backend.contains("Portal"), egui::Button::new("Record new shortcut …")).clicked() {
                     self.recording = true;
                     actions.push(SettingsAction::StartRecording);
                 }
-                if ui.button("Systemeinstellungen öffnen").clicked() {
+                if ui.button("Open system settings").clicked() {
                     actions.push(SettingsAction::OpenSystemShortcuts);
                 }
             });
@@ -234,9 +240,9 @@ impl Settings {
             ui.add_space(4.0);
             ui.colored_label(
                 Color32::from_rgb(0xf3, 0x8b, 0xa8),
-                format!("{} ist bereits belegt von: {conflict}", hotkey::display(&self.config.hotkey)),
+                format!("{} is already used by: {conflict}", hotkey::display(&self.config.hotkey)),
             );
-            if ui.button(format!("Trotzdem verwenden (bei „{conflict}“ entfernen)")).clicked() {
+            if ui.button(format!("Use anyway (remove it from “{conflict}”)")).clicked() {
                 actions.push(SettingsAction::ApplyHotkey { force: true });
             }
         }
@@ -245,7 +251,7 @@ impl Settings {
         }
 
         let before = self.config.hotkey_enabled;
-        ui.checkbox(&mut self.config.hotkey_enabled, "Globales Tastenkürzel registrieren");
+        ui.checkbox(&mut self.config.hotkey_enabled, "Register a global shortcut");
         if before != self.config.hotkey_enabled {
             actions.push(SettingsAction::ApplyHotkey { force: false });
         }
@@ -254,8 +260,8 @@ impl Settings {
         ui.label(RichText::new(format!("Backend: {}", status.backend)).color(t.item_text));
         ui.label(
             RichText::new(
-                "Alternativ kann der Befehl `rlauncher-toggle` in jedem Compositor auf eine Taste gelegt werden \
-                 (Sway, Hyprland, niri, …). Er startet rlauncher auch, falls es noch nicht läuft.",
+                "You can also bind the command `rlauncher-toggle` to a key in any compositor \
+                 (Sway, Hyprland, niri, …). It starts rlauncher as well if it isn't running yet.",
             )
             .color(t.item_text),
         );
@@ -264,8 +270,8 @@ impl Settings {
     fn queries_ui(&mut self, ui: &mut egui::Ui, t: &Theme) {
         ui.label(
             RichText::new(
-                "Queries werden über ihr Keyword aufgerufen, z. B. „re“ findet „reboot“. \
-                 Mit Leerzeichen nach dem Keyword wird der Rest als Argument übergeben.",
+                "Queries are called by their keyword, e.g. “re” finds “reboot”. \
+                 Everything after the keyword and a space is passed on as the argument.",
             )
             .color(t.item_text),
         );
@@ -276,7 +282,7 @@ impl Settings {
             // list
             ui.vertical(|ui| {
                 ui.set_width(list_w);
-                if ui.button("+  Neue Query").clicked() {
+                if ui.button("+  New query").clicked() {
                     self.shortcuts.push(Shortcut {
                         id: config::new_id(),
                         name: String::new(),
@@ -297,7 +303,7 @@ impl Settings {
                         let fill = if selected { t.item_box_selected } else { t.item_box_selected.gamma_multiply(0.5) };
                         ui.painter().rect_filled(rect, t.item_radius.min(10.0), fill);
                     }
-                    let name = if s.name.is_empty() { "(ohne Namen)" } else { s.name.as_str() };
+                    let name = if s.name.is_empty() { "(unnamed)" } else { s.name.as_str() };
                     let (name_c, kw_c) = if selected {
                         (t.item_name_selected, t.item_text_selected)
                     } else {
@@ -311,7 +317,7 @@ impl Settings {
                         FontId::proportional(t.descr_size * 1.2),
                         name_c,
                     );
-                    let kw = if s.keyword.is_empty() { "kein Keyword".to_string() } else { format!("Keyword: {}", s.keyword) };
+                    let kw = if s.keyword.is_empty() { "no keyword".to_string() } else { format!("Keyword: {}", s.keyword) };
                     ui.painter().text(
                         egui::pos2(left, rect.bottom() - 6.0),
                         egui::Align2::LEFT_BOTTOM,
@@ -328,7 +334,7 @@ impl Settings {
             // editor
             ui.vertical(|ui| {
                 let Some(idx) = self.selected.filter(|i| *i < self.shortcuts.len()) else {
-                    ui.label(RichText::new("Wähle links eine Query aus oder lege eine neue an.").color(t.item_text));
+                    ui.label(RichText::new("Select a query on the left or create a new one.").color(t.item_text));
                     return;
                 };
                 let duplicate = {
@@ -339,15 +345,15 @@ impl Settings {
                 let field_w = ui.available_width() - 8.0;
                 egui::Grid::new("query-grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
                     ui.label("Name");
-                    ui.add(egui::TextEdit::singleline(&mut s.name).hint_text("z. B. Neustart").desired_width(field_w - 90.0));
+                    ui.add(egui::TextEdit::singleline(&mut s.name).hint_text("e.g. Reboot").desired_width(field_w - 90.0));
                     ui.end_row();
                     ui.label("Keyword");
-                    ui.add(egui::TextEdit::singleline(&mut s.keyword).hint_text("z. B. reboot").desired_width(field_w - 90.0));
+                    ui.add(egui::TextEdit::singleline(&mut s.keyword).hint_text("e.g. reboot").desired_width(field_w - 90.0));
                     ui.end_row();
                     ui.label("Icon");
                     let mut icon = s.icon.clone().unwrap_or_default();
                     if ui
-                        .add(egui::TextEdit::singleline(&mut icon).hint_text("Icon-Name oder Pfad (optional)").desired_width(field_w - 90.0))
+                        .add(egui::TextEdit::singleline(&mut icon).hint_text("icon name or path (optional)").desired_width(field_w - 90.0))
                         .changed()
                     {
                         s.icon = (!icon.trim().is_empty()).then_some(icon);
@@ -355,9 +361,9 @@ impl Settings {
                     ui.end_row();
                 });
                 if duplicate {
-                    ui.colored_label(Color32::from_rgb(0xf3, 0x8b, 0xa8), "Dieses Keyword wird schon von einer anderen Query verwendet.");
+                    ui.colored_label(Color32::from_rgb(0xf3, 0x8b, 0xa8), "This keyword is already used by another query.");
                 }
-                ui.label("Befehl, Script oder URL");
+                ui.label("Command, script or URL");
                 ui.add(
                     egui::TextEdit::multiline(&mut s.cmd)
                         .code_editor()
@@ -365,19 +371,19 @@ impl Settings {
                         .desired_rows(5)
                         .desired_width(field_w),
                 );
-                ui.checkbox(&mut s.run_without_argument, "Ohne Argument ausführen (Enter führt sofort aus)");
-                ui.checkbox(&mut s.is_default_search, "Als Standardsuche anbieten (Fallback bei jeder Suche)");
+                ui.checkbox(&mut s.run_without_argument, "Run without argument (Enter runs it right away)");
+                ui.checkbox(&mut s.is_default_search, "Offer as default search (fallback for every search)");
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(
-                        "%s wird durch das Argument ersetzt. Beginnt der Befehl mit #!, wird er als Script ausgeführt \
-                         und das Argument angehängt ($1, $2 …). http(s)://-Adressen werden im Browser geöffnet.",
+                        "%s is replaced by the argument. A command starting with #! runs as a script \
+                         and gets the argument appended ($1, $2 …). http(s):// addresses open in the browser.",
                     )
                     .size(t.descr_size)
                     .color(t.item_text),
                 );
                 ui.add_space(6.0);
-                if ui.button(RichText::new("Query löschen").color(Color32::from_rgb(0xf3, 0x8b, 0xa8))).clicked() {
+                if ui.button(RichText::new("Delete query").color(Color32::from_rgb(0xf3, 0x8b, 0xa8))).clicked() {
                     self.shortcuts.remove(idx);
                     self.selected = if self.shortcuts.is_empty() { None } else { Some(idx.saturating_sub(1)) };
                 }
@@ -407,11 +413,11 @@ impl Settings {
             });
         }
 
-        section(ui, t, "Theme-Ordner");
+        section(ui, t, "Theme folders");
         ui.label(
             RichText::new(
-                "Themes im Ulauncher-Format (Ordner mit manifest.json + CSS). Ein Ordner kann mehrere Themes \
-                 enthalten oder selbst ein Theme sein.",
+                "Themes in Ulauncher format (a folder with manifest.json + CSS). A folder can hold several themes \
+                 or be a theme itself.",
             )
             .color(t.item_text),
         );
@@ -432,12 +438,12 @@ impl Settings {
                 }
                 ui.add(egui::Label::new(text).truncate());
                 if !exists {
-                    ui.label(RichText::new("(nicht vorhanden)").color(t.item_text.gamma_multiply(0.6)));
-                } else if ui.small_button("Öffnen").clicked() {
+                    ui.label(RichText::new("(missing)").color(t.item_text.gamma_multiply(0.6)));
+                } else if ui.small_button("Open").clicked() {
                     let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
                 }
                 // index 0 is rlauncher's own folder, then the configured ones
-                if (1..=extra_count).contains(&i) && ui.small_button("Entfernen").clicked() {
+                if (1..=extra_count).contains(&i) && ui.small_button("Remove").clicked() {
                     remove = Some(i - 1);
                 }
             });
@@ -449,27 +455,27 @@ impl Settings {
         ui.horizontal(|ui| {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.new_theme_dir)
-                    .hint_text("weiterer Ordner, z. B. ~/themes/ulauncher")
+                    .hint_text("another folder, e.g. ~/themes/ulauncher")
                     .desired_width(360.0),
             );
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (ui.button("Hinzufügen").clicked() || enter) && !self.new_theme_dir.trim().is_empty() {
+            if (ui.button("Add").clicked() || enter) && !self.new_theme_dir.trim().is_empty() {
                 self.config.theme_dirs.push(self.new_theme_dir.trim().to_string());
                 self.new_theme_dir.clear();
                 self.dirs_changed();
             }
-            if ui.button("Neu einlesen").clicked() {
+            if ui.button("Rescan").clicked() {
                 self.dirs_changed();
             }
         });
 
-        section(ui, t, "Darstellung");
-        if ui.checkbox(&mut self.config.shadow, "Schatten um das Fenster").changed() {
+        section(ui, t, "Display");
+        if ui.checkbox(&mut self.config.shadow, "Shadow around the window").changed() {
             actions.push(SettingsAction::ThemeChanged);
         }
         ui.horizontal(|ui| {
-            ui.label("Schriftart (Pfad zu .ttf/.otf)");
-            ui.add(egui::TextEdit::singleline(&mut self.config.font).hint_text("System-Standard").desired_width(320.0));
+            ui.label("Font (path to a .ttf/.otf)");
+            ui.add(egui::TextEdit::singleline(&mut self.config.font).hint_text("system default").desired_width(320.0));
         });
     }
 
@@ -523,11 +529,11 @@ fn theme_card(ui: &mut egui::Ui, size: egui::Vec2, info: &ThemeInfo, p: &Theme, 
     );
     painter.galley(egui::pos2(rect.left() + 2.0, win.bottom() + 4.0), label, label_color);
     let source = if info.dir.as_ref().is_some_and(|d| d.to_string_lossy().contains("ulauncher")) {
-        "Ulauncher-Theme"
+        "Ulauncher theme"
     } else if info.dir.is_none() {
-        "eingebaut"
+        "built in"
     } else {
-        "rlauncher-Theme"
+        "rlauncher theme"
     };
     resp.on_hover_text(format!(
         "{source}\n{}",
