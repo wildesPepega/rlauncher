@@ -174,6 +174,7 @@ fn app_item(app: &App, query: &str) -> ResultItem {
             argv: apps::app_argv(app),
             cwd: app.workdir.clone(),
             terminal: app.terminal,
+            app_id: Some(app.id.trim_end_matches(".desktop").to_string()),
         }),
         alt_action: Some(Action::Launch(LaunchSpec::Open(
             app.file.parent().unwrap_or(Path::new("/")).to_string_lossy().into_owned(),

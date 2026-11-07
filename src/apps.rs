@@ -517,7 +517,8 @@ pub fn terminal_prefix(configured: &str) -> Vec<String> {
 /// What to start once the launcher has an activation token.
 #[derive(Debug, Clone)]
 pub enum LaunchSpec {
-    Argv { argv: Vec<String>, cwd: Option<String>, terminal: bool },
+    /// `app_id` is the desktop file id without `.desktop`, used to name the app's scope.
+    Argv { argv: Vec<String>, cwd: Option<String>, terminal: bool, app_id: Option<String> },
     /// A shell snippet, run like Ulauncher does: written to a temp file and executed with
     /// the argument appended.
     Script { script: String, args: Option<String> },
@@ -528,7 +529,7 @@ pub enum LaunchSpec {
 /// started app to take focus on Wayland. `terminal` is the configured terminal command.
 pub fn spawn(spec: &LaunchSpec, token: Option<&str>, terminal: &str) {
     let result = match spec {
-        LaunchSpec::Argv { argv, cwd, terminal: in_terminal } => {
+        LaunchSpec::Argv { argv, cwd, terminal: in_terminal, app_id } => {
             let argv: Vec<String> = if *in_terminal {
                 terminal_prefix(terminal).into_iter().chain(argv.iter().cloned()).collect()
             } else {
@@ -541,7 +542,10 @@ pub fn spawn(spec: &LaunchSpec, token: Option<&str>, terminal: &str) {
             if let Some(cwd) = cwd.filter(|c| c.is_dir()) {
                 cmd.current_dir(cwd);
             }
-            run_detached(cmd, token)
+            let id = app_id.clone().unwrap_or_else(|| {
+                Path::new(prog).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            });
+            run_detached(cmd, token, &id)
         }
         LaunchSpec::Open(target) => {
             let mut cmd = Command::new("xdg-open");
@@ -549,7 +553,7 @@ pub fn spawn(spec: &LaunchSpec, token: Option<&str>, terminal: &str) {
             if let Some(home) = dirs::home_dir() {
                 cmd.current_dir(home);
             }
-            run_detached(cmd, token)
+            run_detached(cmd, token, "xdg-open")
         }
         LaunchSpec::Script { script, args } => run_script(script, args.as_deref(), token),
     };
@@ -561,7 +565,57 @@ pub fn spawn(spec: &LaunchSpec, token: Option<&str>, terminal: &str) {
 /// Set when rlauncher disabled MangoHud for itself; launched apps get the user's setting.
 pub static STRIP_DISABLE_MANGOHUD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn run_detached(mut cmd: Command, token: Option<&str>) -> std::io::Result<()> {
+/// `systemd-run`, if the session runs under a systemd user manager.
+fn systemd_run() -> Option<&'static Path> {
+    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)?;
+        if !cgroup.contains("/user@") || !runtime.join("systemd/private").exists() {
+            return None;
+        }
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).map(|d| d.join("systemd-run")).find(|p| p.is_file())
+    })
+    .as_deref()
+}
+
+/// Scope unit name following the systemd/XDG convention `app-<launcher>-<app id>-<random>.scope`.
+pub fn scope_name(app_id: &str) -> String {
+    let mut esc = String::new();
+    for b in app_id.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.' | b':' => esc.push(b as char),
+            _ => esc.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    if esc.is_empty() {
+        esc.push_str("app");
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("app-rlauncher-{esc}-{:08x}.scope", (nanos as u64 ^ (std::process::id() as u64) << 32) as u32)
+}
+
+/// Runs `cmd` in its own systemd scope (like KRunner and GNOME do). Otherwise the launched
+/// app would live in rlauncher's own cgroup, and system monitors would count all of its
+/// memory and CPU usage as rlauncher's.
+fn in_own_scope(cmd: Command, app_id: &str) -> Command {
+    let Some(run) = systemd_run() else { return cmd };
+    let mut scoped = Command::new(run);
+    scoped
+        .args(["--user", "--scope", "--collect", "--quiet", "--slice=app.slice"])
+        .arg(format!("--unit={}", scope_name(app_id)))
+        .arg("--")
+        .arg(cmd.get_program())
+        .args(cmd.get_args());
+    if let Some(dir) = cmd.get_current_dir() {
+        scoped.current_dir(dir);
+    }
+    scoped
+}
+
+fn run_detached(cmd: Command, token: Option<&str>, app_id: &str) -> std::io::Result<()> {
+    let mut cmd = in_own_scope(cmd, app_id);
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     if STRIP_DISABLE_MANGOHUD.load(std::sync::atomic::Ordering::Relaxed) {
         cmd.env_remove("DISABLE_MANGOHUD");
@@ -604,7 +658,7 @@ fn run_script(script: &str, args: Option<&str>, token: Option<&str>) -> std::io:
     if let Some(home) = dirs::home_dir() {
         cmd.current_dir(home);
     }
-    run_detached(cmd, token)?;
+    run_detached(cmd, token, "rlauncher-query")?;
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(2));
         let _ = std::fs::remove_file(file);
@@ -614,6 +668,14 @@ fn run_script(script: &str, args: Option<&str>, token: Option<&str>) -> std::io:
 
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[test]
+fn scope_names_are_valid_unit_names() {
+    let n = scope_name("org.kde.dolphin");
+    assert!(n.starts_with("app-rlauncher-org.kde.dolphin-") && n.ends_with(".scope"), "{n}");
+    let n = scope_name("steam-app 1");
+    assert!(n.starts_with("app-rlauncher-steam\\x2dapp\\x201-"), "{n}");
 }
 
 #[cfg(test)]
