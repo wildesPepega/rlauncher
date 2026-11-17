@@ -24,6 +24,11 @@ function place(w) {{
     if (!w || w.resourceClass !== "{RUN_APP_ID}" || w.transient) return;
     const area = workspace.clientArea(KWin.MaximizeArea, w);
     const g = w.frameGeometry;
+    if (w.caption !== "Run") {{
+        // the settings window: centered
+        w.frameGeometry = {{ x: Math.round(area.x + (area.width - g.width) / 2), y: Math.round(area.y + (area.height - g.height) / 2), width: g.width, height: g.height }};
+        return;
+    }}
     w.frameGeometry = {{ x: Math.round({x}), y: Math.round({y}), width: g.width, height: g.height }};
 }}
 workspace.windowAdded.connect(place);

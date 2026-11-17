@@ -23,8 +23,6 @@ pub enum UiEvent {
     Copy(String),
     Hotkey(HotkeyCmd),
     OpenSettings,
-    /// "Browse…" in the Run dialog: pick a file with the portal file chooser.
-    Browse,
 }
 
 /// Navigation keys handled by the launcher itself (not by the text field).
@@ -486,14 +484,20 @@ impl Launcher {
 
     fn settings_page(&mut self, ctx: &egui::Context) {
         let screen = ctx.content_rect();
-        let width = self.config.width.max(860.0).min(screen.width() - 32.0);
-        let x = screen.center().x - width / 2.0;
-        let y = screen.top() + screen.height() * self.config.top_offset.clamp(0.0, 0.8);
-        let y = y.min(screen.bottom() - 420.0).max(screen.top() + 16.0);
-        let height = (screen.bottom() - y - 48.0).clamp(300.0, 600.0);
         let t = self.theme.clone();
+        // In the Run dialog's window mode the settings are a window of their own: fill it.
+        let (x, y, width, height, frame) = if self.run.toplevel {
+            let frame = egui::Frame::new().fill(t.window_bg).inner_margin(egui::Margin::same(PADDING as i8));
+            (screen.left(), screen.top(), screen.width() + 2.0 * t.border_width, screen.height() - 2.0 * PADDING, frame)
+        } else {
+            let width = self.config.width.max(860.0).min(screen.width() - 32.0);
+            let x = screen.center().x - width / 2.0;
+            let y = screen.top() + screen.height() * self.config.top_offset.clamp(0.0, 0.8);
+            let y = y.min(screen.bottom() - 420.0).max(screen.top() + 16.0);
+            let height = (screen.bottom() - y - 48.0).clamp(300.0, 600.0);
+            (x, y, width, height, self.window_frame())
+        };
         let status = self.hotkey_status.lock().map(|s| s.clone()).unwrap_or_default();
-        let frame = self.window_frame();
         let mut actions = Vec::new();
         egui::Area::new(egui::Id::unique("rlauncher-settings"))
             .fixed_pos(pos2(x.round(), y.round()))

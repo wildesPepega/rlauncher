@@ -130,6 +130,8 @@ struct Window {
     shell: Shell,
     /// Toplevels have a fixed size (logical).
     fixed_size: Option<(u32, u32)>,
+    /// A toplevel created for the settings page (instead of the Run dialog).
+    settings: bool,
     surface: Option<wgpu::Surface<'static>>,
     fractional: Option<WpFractionalScaleV1>,
     viewport: Option<WpViewport>,
@@ -170,6 +172,10 @@ struct ProbeSurface {
     viewport: WpViewport,
     buffer: wl_buffer::WlBuffer,
 }
+
+/// Size and title of the settings window (Run dialog layout in window mode).
+const SETTINGS_WINDOW: (u32, u32) = (900, 640);
+const SETTINGS_TITLE: &str = "rlauncher Settings";
 
 /// How long to wait for the pointer to enter a probe surface.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(150);
@@ -618,10 +624,11 @@ impl State {
         let viewport = self.viewporter.as_ref().map(|v| v.get_viewport(&surface, &self.qh, ()));
         let run_window = self.run_as_window();
         self.launcher.run.toplevel = run_window;
+        let settings = run_window && self.launcher.in_settings();
         let (shell, fixed_size) = if run_window && let Some(xdg) = &self.xdg_shell {
-            let size = (crate::win7::CLIENT.x as u32, crate::win7::CLIENT.y as u32);
+            let size = if settings { SETTINGS_WINDOW } else { (crate::win7::CLIENT.x as u32, crate::win7::CLIENT.y as u32) };
             let window = xdg.create_window(surface, WindowDecorations::RequestServer, &self.qh);
-            window.set_title("Run");
+            window.set_title(if settings { SETTINGS_TITLE } else { "Run" });
             window.set_app_id(crate::win7::RUN_APP_ID);
             window.set_min_size(Some(size));
             window.set_max_size(Some(size));
@@ -641,6 +648,7 @@ impl State {
         self.window = Some(Window {
             shell,
             fixed_size,
+            settings,
             surface: None,
             fractional,
             viewport,
@@ -666,6 +674,16 @@ impl State {
                 self.hotkey.send(cmd);
             }
         }
+        self.drop_window();
+        if let Some(t) = self.repaint_timer.take() {
+            self.loop_handle.remove(t);
+        }
+        self.keyboard_focus = false;
+        self.pointer_pos = None;
+    }
+
+    /// Destroys the main window's surfaces (without saving or resetting anything).
+    fn drop_window(&mut self) {
         if let Some(mut win) = self.window.take() {
             // The wgpu surface must go before the wl_surface it renders to.
             drop(win.surface.take());
@@ -681,11 +699,21 @@ impl State {
             drop(win);
             let _ = self.conn.flush();
         }
-        if let Some(t) = self.repaint_timer.take() {
-            self.loop_handle.remove(t);
+    }
+
+    /// In window mode the Run dialog and the settings are separate windows: switch between
+    /// them when the settings are opened or closed.
+    fn sync_window_kind(&mut self) {
+        let Some(win) = self.window.as_ref() else { return };
+        if !matches!(win.shell, Shell::Toplevel(_)) || win.settings == self.launcher.in_settings() {
+            return;
         }
+        self.close_message_box();
+        self.drop_window();
         self.keyboard_focus = false;
         self.pointer_pos = None;
+        self.egui_events.clear();
+        self.create_window(None);
     }
 
     fn ensure_gpu(&mut self, surface: &wgpu::Surface<'static>) -> anyhow::Result<()> {
@@ -949,6 +977,7 @@ impl State {
         self.msgbox = Some(Window {
             shell: Shell::Toplevel(window),
             fixed_size: Some(size),
+            settings: false,
             surface: None,
             fractional,
             viewport,
@@ -1111,6 +1140,11 @@ impl State {
     }
 
     fn process_ui_events(&mut self) {
+        self.handle_ui_events();
+        self.sync_window_kind();
+    }
+
+    fn handle_ui_events(&mut self) {
         for ev in std::mem::take(&mut self.launcher.events) {
             match ev {
                 UiEvent::Hide => self.hide(),
@@ -1121,22 +1155,8 @@ impl State {
                     self.launcher.open_settings(None);
                     self.redraw = true;
                 }
-                UiEvent::Browse => self.browse(),
             }
         }
-    }
-
-    /// "Browse…": hides the dialog, lets the user pick a file with the portal's file chooser
-    /// and opens the dialog again with the chosen path (or the old text when cancelled).
-    fn browse(&mut self) {
-        let previous = self.launcher.run.text.clone();
-        self.hide();
-        let tx = self.msg_tx.clone();
-        std::thread::spawn(move || {
-            let chosen = pick_file();
-            let text = chosen.map(|p| crate::run::quote_path(&p)).unwrap_or(previous);
-            let _ = tx.send(Msg::Command(Command::Show, Some(text)));
-        });
     }
 
     /// Launches with an XDG activation token so the new window gets focus.
@@ -1309,30 +1329,6 @@ fn add_rounded(region: &smithay_client_toolkit::compositor::Region, r: egui::Rec
         region.add(x + inset, y + i, w - 2 * inset, 1);
         region.add(x + inset, y + h - 1 - i, w - 2 * inset, 1);
     }
-}
-
-#[cfg(feature = "portal")]
-fn pick_file() -> Option<String> {
-    use ashpd::desktop::file_chooser::SelectedFiles;
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
-    let uri = rt.block_on(async {
-        let request = SelectedFiles::open_file().title("Browse").modal(true).multiple(false).send().await;
-        let files = match request.and_then(|r| r.response()) {
-            Ok(f) => f,
-            Err(e) => {
-                log::info!("file chooser: {e}");
-                return None;
-            }
-        };
-        files.uris().first().map(|u| u.to_string())
-    })?;
-    crate::run::uri_to_path(&uri)
-}
-
-#[cfg(not(feature = "portal"))]
-fn pick_file() -> Option<String> {
-    log::warn!("built without portal support, Browse… is not available");
-    None
 }
 
 fn egui_modifiers(m: &Modifiers) -> egui::Modifiers {
@@ -1522,6 +1518,11 @@ impl State {
 impl WindowHandler for State {
     fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &XdgWindow) {
         match self.which_surface(window.wl_surface()) {
+            // the settings window's X goes back to the Run dialog
+            Some(Which::Main) if self.launcher.in_settings() => {
+                self.launcher.close_settings(&self.egui_ctx);
+                self.process_ui_events();
+            }
             Some(Which::Main) => self.hide(),
             Some(Which::Message) => {
                 self.launcher.run.close_error();

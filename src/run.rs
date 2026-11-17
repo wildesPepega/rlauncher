@@ -100,7 +100,7 @@ pub fn resolve(text: &str, apps: &[App], shortcuts: &[Shortcut]) -> Option<Launc
         return Some(LaunchSpec::Open(format!("https://{text}")));
     }
 
-    // Files and folders, also "quoted paths" as inserted by Browse…
+    // Files and folders, also "quoted paths"
     let unquoted = text.trim_matches('"');
     if unquoted.starts_with('/') || unquoted.starts_with('~') || unquoted.starts_with("./") {
         let path = expand_tilde(unquoted);
@@ -141,32 +141,6 @@ pub fn resolve(text: &str, apps: &[App], shortcuts: &[Shortcut]) -> Option<Launc
     })
 }
 
-/// Turns a `file://` URI from the file chooser into a path.
-pub fn uri_to_path(uri: &str) -> Option<String> {
-    let rest = uri.strip_prefix("file://")?;
-    let bytes = rest.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Some(b) = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok())
-        {
-            out.push(b);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-/// How a chosen file is put into the input field: quoted when it contains spaces.
-pub fn quote_path(path: &str) -> String {
-    if path.contains(char::is_whitespace) { format!("\"{path}\"") } else { path.to_string() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,12 +179,5 @@ mod tests {
         assert_eq!(matches(&h, "f"), vec!["firefox", "Fish"]);
         assert_eq!(matches(&h, "").len(), 4);
         assert!(matches(&h, "firefox").is_empty());
-    }
-
-    #[test]
-    fn file_uris_are_decoded() {
-        assert_eq!(uri_to_path("file:///home/a%20b/x.sh").as_deref(), Some("/home/a b/x.sh"));
-        assert_eq!(quote_path("/home/a b/x.sh"), "\"/home/a b/x.sh\"");
-        assert_eq!(uri_to_path("https://x"), None);
     }
 }

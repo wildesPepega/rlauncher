@@ -406,7 +406,7 @@ impl Settings {
             ui.label(
                 RichText::new(
                     "Type a command, path, URL, app name or query keyword. Your run history is the drop-down \
-                     list (Down key or the arrow). Click the icon in the dialog to open these settings.",
+                     list (Down key or the arrow). Browse... (or the icon) in the dialog opens these settings.",
                 )
                 .color(t.item_text),
             );

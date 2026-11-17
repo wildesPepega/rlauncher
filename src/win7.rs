@@ -356,8 +356,9 @@ impl RunDialog {
                 if look.button(ui, at(206.0, 137.0, 86.0, 24.0), "Cancel", None, true, false).clicked() && !blocked {
                     events.push(UiEvent::Hide);
                 }
+                // "Browse..." opens rlauncher's settings
                 if look.button(ui, at(300.0, 137.0, 88.0, 24.0), "Browse...", Some(0), true, false).clicked() && !blocked {
-                    events.push(UiEvent::Browse);
+                    events.push(UiEvent::OpenSettings);
                 }
 
                 // ---- drop-down with the run history
