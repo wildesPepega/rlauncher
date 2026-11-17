@@ -75,6 +75,8 @@ pub struct Launcher {
     hotkey_status: Arc<Mutex<HotkeyStatus>>,
     /// State of the Windows 7 style Run dialog layout.
     pub run: RunDialog,
+    error_icon_image: Option<egui::ColorImage>,
+    message_icon: Option<egui::TextureHandle>,
 }
 
 const PADDING: f32 = 12.0;
@@ -111,6 +113,8 @@ impl Launcher {
             settings: None,
             hotkey_status: Arc::default(),
             run: RunDialog::default(),
+            error_icon_image: None,
+            message_icon: None,
         }
     }
 
@@ -238,6 +242,12 @@ impl Launcher {
     }
 
     pub fn icon_loaded(&mut self, icon: LoadedIcon) {
+        if icon.spec == "dialog-error@32"
+            && let Some(img) = &icon.image
+        {
+            // the message box window has its own egui context and needs its own texture
+            self.error_icon_image = Some(img.clone());
+        }
         let state = match icon.image {
             Some(img) => IconState::Image(img),
             None => IconState::Missing,
@@ -421,6 +431,8 @@ impl Launcher {
             return;
         }
         if self.run_layout() {
+            self.run.run_icon = self.icon_texture(ctx, "system-run@32").map(|t| t.id());
+            self.run.error_icon = self.icon_texture(ctx, "dialog-error@32").map(|t| t.id());
             self.run.ui(ctx, &self.config, &self.apps, &self.shortcuts, &mut self.events);
             return;
         }
@@ -707,6 +719,17 @@ impl Launcher {
             self.selected = i;
             self.activate(i, ctx.input(|i| i.modifiers.alt));
         }
+    }
+
+    /// The Run dialog's error message box (a window with its own egui context).
+    pub fn message_ui(&mut self, ctx: &egui::Context) {
+        if self.message_icon.is_none()
+            && let Some(img) = self.error_icon_image.take()
+        {
+            self.message_icon = Some(ctx.load_texture("msgbox-error-icon", img, egui::TextureOptions::LINEAR));
+        }
+        self.run.error_icon = self.message_icon.as_ref().map(|t| t.id());
+        self.run.message_ui(ctx);
     }
 
     fn icon_texture(&mut self, ctx: &egui::Context, spec: &str) -> Option<egui::TextureHandle> {

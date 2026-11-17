@@ -29,14 +29,20 @@ impl IconLoader {
                 let mut index = IconIndex::build();
                 let mut built = std::time::Instant::now();
                 for spec in rx {
-                    let mut path = index.resolve(&spec);
+                    // "name@32": a specific size, e.g. for the Run dialog's pixel-exact icons
+                    let (name, size) = match spec.rsplit_once('@').and_then(|(n, s)| Some((n, s.parse::<u32>().ok()?))) {
+                        Some((n, s)) => (n.to_string(), s),
+                        None => (spec.clone(), ICON_PX),
+                    };
+                    let mut path = index.resolve(&name);
                     // A freshly installed app may bring icons the index doesn't know yet.
                     if path.is_none() && built.elapsed() > std::time::Duration::from_secs(3) {
                         index = IconIndex::build();
                         built = std::time::Instant::now();
-                        path = index.resolve(&spec);
+                        path = index.resolve(&name);
                     }
-                    let image = path.and_then(|p| load_image(&p, ICON_PX));
+                    let path = path.map(|p| if size == ICON_PX { p } else { sized_variant(&p, size) });
+                    let image = path.and_then(|p| load_image(&p, size));
                     done(LoadedIcon { spec, image });
                 }
             })
@@ -86,10 +92,41 @@ fn icon_base_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// The same icon in another size folder of its theme ("…/256/x.png" -> "…/32/x.png"),
+/// if the theme has one; otherwise `path`.
+fn sized_variant(path: &Path, size: u32) -> PathBuf {
+    let comps: Vec<_> = path.components().collect();
+    for (i, c) in comps.iter().enumerate().rev().skip(1) {
+        let name = c.as_os_str().to_string_lossy();
+        let replacement = if name.parse::<u32>().is_ok() {
+            size.to_string()
+        } else if name.split_once('x').is_some_and(|(a, b)| a.parse::<u32>().is_ok() && b.parse::<u32>().is_ok()) {
+            format!("{size}x{size}")
+        } else {
+            continue;
+        };
+        let mut p = PathBuf::new();
+        for (j, c) in comps.iter().enumerate() {
+            if i == j {
+                p.push(&replacement);
+            } else {
+                p.push(c.as_os_str());
+            }
+        }
+        return if p.is_file() { p } else { path.to_path_buf() };
+    }
+    path.to_path_buf()
+}
+
 /// The user's icon theme (KDE, GNOME or GTK settings), if it can be found.
 fn user_icon_theme() -> Option<String> {
     let cfg = dirs::config_dir()?;
-    if let Ok(text) = std::fs::read_to_string(cfg.join("kdeglobals")) {
+    // KDE: kdeglobals in the user's folder, then the system-wide defaults (XDG_CONFIG_DIRS,
+    // e.g. a global theme like AeroThemePlasma)
+    let xdg = std::env::var("XDG_CONFIG_DIRS").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/etc/xdg".into());
+    let kde_dirs = std::iter::once(cfg.clone()).chain(xdg.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+    for dir in kde_dirs {
+        let Ok(text) = std::fs::read_to_string(dir.join("kdeglobals")) else { continue };
         let mut in_icons = false;
         for line in text.lines() {
             let line = line.trim();

@@ -17,7 +17,7 @@ use smithay_client_toolkit::{
     activation::{ActivationHandler, ActivationState, RequestData},
     compositor::{CompositorHandler, CompositorState},
     delegate_activation, delegate_compositor, delegate_keyboard, delegate_layer, delegate_output,
-    delegate_pointer, delegate_registry, delegate_seat, delegate_shm,
+    delegate_pointer, delegate_registry, delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     reexports::calloop::{
         self, EventLoop, LoopHandle, RegistrationToken,
@@ -35,6 +35,10 @@ use smithay_client_toolkit::{
     },
     shell::{
         WaylandSurface,
+        xdg::{
+            XdgShell,
+            window::{DecorationMode, Window as XdgWindow, WindowConfigure, WindowDecorations, WindowHandler},
+        },
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
             LayerSurfaceConfigure,
@@ -73,6 +77,8 @@ pub enum Msg {
     Redraw,
     /// A desktop entry was added, changed or removed.
     AppsChanged,
+    /// The Kvantum theme for the Run dialog was loaded (or there is none).
+    Kvantum(Option<Box<crate::kvantum::Kvantum>>),
 }
 
 /// Wrapper so wgpu can open the EGL/Vulkan display for our Wayland connection.
@@ -98,8 +104,32 @@ struct Gpu {
     format: wgpu::TextureFormat,
 }
 
+/// The Wayland role of a window: the launcher overlay or a normal (toplevel) window.
+enum Shell {
+    Layer(LayerSurface),
+    Toplevel(XdgWindow),
+}
+
+impl Shell {
+    fn wl_surface(&self) -> &wl_surface::WlSurface {
+        match self {
+            Shell::Layer(l) => l.wl_surface(),
+            Shell::Toplevel(w) => w.wl_surface(),
+        }
+    }
+}
+
+/// Which of the windows: the launcher / Run dialog, or the Run dialog's error message box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Which {
+    Main,
+    Message,
+}
+
 struct Window {
-    layer: LayerSurface,
+    shell: Shell,
+    /// Toplevels have a fixed size (logical).
+    fixed_size: Option<(u32, u32)>,
     surface: Option<wgpu::Surface<'static>>,
     fractional: Option<WpFractionalScaleV1>,
     viewport: Option<WpViewport>,
@@ -163,6 +193,19 @@ pub struct State {
     fractional_manager: Option<WpFractionalScaleManagerV1>,
     viewporter: Option<WpViewporter>,
     blur_manager: Option<OrgKdeKwinBlurManager>,
+    xdg_shell: Option<XdgShell>,
+    /// The compositor draws window frames (xdg-decoration), needed for the Run dialog window.
+    server_decorations: bool,
+    /// The Run dialog's error message box (a second toplevel) and its own egui context.
+    msgbox: Option<Window>,
+    msg_ctx: egui::Context,
+    msg_renderer: Option<egui_wgpu::Renderer>,
+    msg_events: Vec<egui::Event>,
+    msg_redraw: bool,
+    /// Kvantum theme loading was started (for the Run dialog).
+    kvantum_requested: bool,
+    /// The KWin placement script that was installed for the Run dialog.
+    placement_applied: Option<String>,
 
     seat: Option<wl_seat::WlSeat>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -220,6 +263,10 @@ pub fn run(listener: UnixListener, show_on_start: bool) -> anyhow::Result<()> {
     let viewporter = bind_optional::<WpViewporter>(&globals, &qh);
     let output_order_global = bind_optional::<KdeOutputOrderV1>(&globals, &qh);
     let blur_manager = bind_optional::<OrgKdeKwinBlurManager>(&globals, &qh);
+    let xdg_shell = XdgShell::bind(&globals, &qh).ok();
+    let server_decorations = globals
+        .contents()
+        .with_list(|list| list.iter().any(|g| g.interface == "zxdg_decoration_manager_v1"));
 
     let display_ptr = NonNull::new(conn.backend().display_ptr() as *mut std::ffi::c_void)
         .context("null wayland display")?;
@@ -289,6 +336,15 @@ pub fn run(listener: UnixListener, show_on_start: bool) -> anyhow::Result<()> {
         fractional_manager,
         viewporter,
         blur_manager,
+        xdg_shell,
+        server_decorations,
+        msgbox: None,
+        msg_ctx: egui::Context::default(),
+        msg_renderer: None,
+        msg_events: Vec::new(),
+        msg_redraw: false,
+        kvantum_requested: false,
+        placement_applied: None,
         seat: None,
         keyboard: None,
         pointer: None,
@@ -320,6 +376,8 @@ pub fn run(listener: UnixListener, show_on_start: bool) -> anyhow::Result<()> {
     };
     state.launcher.setup(&state.egui_ctx);
     state.launcher.run.blur_available = state.blur_manager.is_some();
+    state.launcher.setup(&state.msg_ctx);
+    state.prepare_run_dialog();
     state.rescan_apps();
     // Live updates of the app list while running (and while the launcher is open).
     let tx = state.msg_tx.clone();
@@ -337,6 +395,10 @@ pub fn run(listener: UnixListener, show_on_start: bool) -> anyhow::Result<()> {
         if state.redraw {
             state.redraw = false;
             state.draw();
+        }
+        if state.msg_redraw {
+            state.msg_redraw = false;
+            state.draw_message_box();
         }
     }
     Ok(())
@@ -367,6 +429,10 @@ impl State {
                 }
             }
             Msg::Redraw => self.redraw = self.window.is_some(),
+            Msg::Kvantum(k) => {
+                self.launcher.run.kv = k.map(|k| *k);
+                self.redraw = self.window.is_some();
+            }
             Msg::AppsChanged => {
                 log::debug!("application folders changed, rescanning");
                 self.rescan_apps();
@@ -432,6 +498,12 @@ impl State {
         self.launcher.reload(&self.egui_ctx);
         self.launcher.reset();
         self.rescan_apps();
+        self.prepare_run_dialog();
+        if self.run_as_window() {
+            // the compositor places normal windows (KWin: with the placement script)
+            self.create_window(None);
+            return;
+        }
 
         match self.launcher.config.monitor {
             Monitor::Primary => {
@@ -544,18 +616,31 @@ impl State {
             .as_ref()
             .map(|m| m.get_fractional_scale(&surface, &self.qh, surface.clone()));
         let viewport = self.viewporter.as_ref().map(|v| v.get_viewport(&surface, &self.qh, ()));
-        let layer =
-            self.layer_shell
-                .create_layer_surface(&self.qh, surface, Layer::Overlay, Some("rlauncher"), output);
-        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-        // The Run dialog sits above the panels (like on Windows), the launcher covers everything.
-        layer.set_exclusive_zone(if self.launcher.run_layout() { 0 } else { -1 });
-        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        layer.set_size(0, 0);
-        layer.commit();
+        let run_window = self.run_as_window();
+        self.launcher.run.toplevel = run_window;
+        let (shell, fixed_size) = if run_window && let Some(xdg) = &self.xdg_shell {
+            let size = (crate::win7::CLIENT.x as u32, crate::win7::CLIENT.y as u32);
+            let window = xdg.create_window(surface, WindowDecorations::RequestServer, &self.qh);
+            window.set_title("Run");
+            window.set_app_id(crate::win7::RUN_APP_ID);
+            window.set_min_size(Some(size));
+            window.set_max_size(Some(size));
+            window.commit();
+            (Shell::Toplevel(window), Some(size))
+        } else {
+            let layer = self.layer_shell.create_layer_surface(&self.qh, surface, Layer::Overlay, Some("rlauncher"), output);
+            layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+            // The Run dialog overlay sits above the panels (like on Windows), the launcher covers everything.
+            layer.set_exclusive_zone(if self.launcher.run_layout() { 0 } else { -1 });
+            layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+            layer.set_size(0, 0);
+            layer.commit();
+            (Shell::Layer(layer), None)
+        };
 
         self.window = Some(Window {
-            layer,
+            shell,
+            fixed_size,
             surface: None,
             fractional,
             viewport,
@@ -575,6 +660,7 @@ impl State {
 
     fn hide(&mut self) {
         self.cancel_probe();
+        self.close_message_box();
         if self.window.is_some() {
             for cmd in self.launcher.on_hide(&self.egui_ctx) {
                 self.hotkey.send(cmd);
@@ -627,8 +713,13 @@ impl State {
         Ok(())
     }
 
-    fn configure_surface(&mut self) {
-        let Some(win) = self.window.as_mut() else { return };
+    fn configure_surface(&mut self, which: Which) {
+        let Some(win) = (match which {
+            Which::Main => self.window.as_mut(),
+            Which::Message => self.msgbox.as_mut(),
+        }) else {
+            return;
+        };
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), win.surface.as_ref()) else { return };
         let (w, h) = win.physical_size();
         let caps = surface.get_capabilities(&gpu.adapter);
@@ -658,7 +749,7 @@ impl State {
         if let Some(vp) = &win.viewport {
             vp.set_destination(win.width as i32, win.height as i32);
         } else {
-            win.layer.wl_surface().set_buffer_scale(win.buffer_scale);
+            win.shell.wl_surface().set_buffer_scale(win.buffer_scale);
         }
         win.needs_reconfigure = false;
     }
@@ -669,7 +760,7 @@ impl State {
             return;
         }
         if win.needs_reconfigure {
-            self.configure_surface();
+            self.configure_surface(Which::Main);
         }
         let Some(win) = self.window.as_mut() else { return };
         let scale = win.scale as f32;
@@ -694,6 +785,7 @@ impl State {
         let ctx = self.egui_ctx.clone();
         let launcher = &mut self.launcher;
         let mut output = ctx.run_ui(raw, |ui| launcher.ui(ui.ctx()));
+
 
         // Clipboard + cursor
         for cmd in &output.platform_output.commands {
@@ -794,13 +886,13 @@ impl State {
             if glass.is_empty() {
                 if let Some(b) = win.blur.take() {
                     b.release();
-                    manager.unset(win.layer.wl_surface());
+                    manager.unset(win.shell.wl_surface());
                 }
             } else if let Ok(region) = smithay_client_toolkit::compositor::Region::new(&self.compositor) {
                 for r in glass {
                     add_rounded(&region, *r, 6.0);
                 }
-                let blur = win.blur.get_or_insert_with(|| manager.create(win.layer.wl_surface(), &self.qh, ()));
+                let blur = win.blur.get_or_insert_with(|| manager.create(win.shell.wl_surface(), &self.qh, ()));
                 blur.set_region(Some(region.wl_region()));
                 blur.commit();
             }
@@ -809,7 +901,7 @@ impl State {
         // Ask for a frame callback before presenting (presenting commits the surface).
         let animating = repaint_delay.is_zero();
         if animating && !win.frame_pending {
-            let surf = win.layer.wl_surface();
+            let surf = win.shell.wl_surface();
             surf.frame(&self.qh, surf.clone());
             win.frame_pending = true;
         }
@@ -820,6 +912,190 @@ impl State {
             self.schedule_repaint(repaint_delay);
         }
         self.process_ui_events();
+        self.sync_message_box();
+    }
+
+    /// Opens or closes the error message box window to match the Run dialog's state.
+    fn sync_message_box(&mut self) {
+        let wanted = self.launcher.run.toplevel && self.launcher.run.error().is_some();
+        if wanted && self.msgbox.is_none() {
+            self.open_message_box();
+        } else if !wanted && self.msgbox.is_some() {
+            self.close_message_box();
+        }
+    }
+
+    fn open_message_box(&mut self) {
+        let (Some(xdg), Some(Shell::Toplevel(parent))) = (&self.xdg_shell, self.window.as_ref().map(|w| &w.shell)) else {
+            return;
+        };
+        let size = self.launcher.run.message_size(&self.egui_ctx);
+        let size = (size.x.ceil() as u32, size.y.ceil() as u32);
+        let surface = self.compositor.create_surface(&self.qh);
+        let fractional = self
+            .fractional_manager
+            .as_ref()
+            .map(|m| m.get_fractional_scale(&surface, &self.qh, surface.clone()));
+        let viewport = self.viewporter.as_ref().map(|v| v.get_viewport(&surface, &self.qh, ()));
+        let window = xdg.create_window(surface, WindowDecorations::RequestServer, &self.qh);
+        let title: String = self.launcher.run.error().unwrap_or_default().chars().take(60).collect();
+        window.set_title(title);
+        window.set_app_id(crate::win7::RUN_APP_ID);
+        window.set_parent(Some(parent));
+        window.set_min_size(Some(size));
+        window.set_max_size(Some(size));
+        window.commit();
+        self.msg_events.clear();
+        self.msgbox = Some(Window {
+            shell: Shell::Toplevel(window),
+            fixed_size: Some(size),
+            surface: None,
+            fractional,
+            viewport,
+            width: size.0,
+            height: size.1,
+            scale: self.window.as_ref().map(|w| w.scale).unwrap_or(1.0),
+            buffer_scale: 1,
+            configured: false,
+            needs_reconfigure: true,
+            frame_pending: false,
+            blur: None,
+            blur_rects: Vec::new(),
+        });
+    }
+
+    fn close_message_box(&mut self) {
+        if let Some(mut win) = self.msgbox.take() {
+            drop(win.surface.take());
+            if let Some(f) = win.fractional.take() {
+                f.destroy();
+            }
+            if let Some(v) = win.viewport.take() {
+                v.destroy();
+            }
+            drop(win);
+            let _ = self.conn.flush();
+        }
+    }
+
+    /// Renders the error message box window (its own egui context and renderer).
+    fn draw_message_box(&mut self) {
+        let Some(win) = self.msgbox.as_ref() else { return };
+        if !win.configured || win.surface.is_none() {
+            return;
+        }
+        if win.needs_reconfigure {
+            self.configure_surface(Which::Message);
+        }
+        let (Some(gpu), Some(win)) = (self.gpu.as_mut(), self.msgbox.as_mut()) else { return };
+        let scale = win.scale as f32;
+        let (pw, ph) = win.physical_size();
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(win.width as f32, win.height as f32))),
+            time: Some(self.start_time.elapsed().as_secs_f64()),
+            events: std::mem::take(&mut self.msg_events),
+            focused: true,
+            max_texture_side: Some(gpu.device.limits().max_texture_dimension_2d as usize),
+            ..Default::default()
+        };
+        if let Some(vp) = raw.viewports.get_mut(&egui::ViewportId::ROOT) {
+            vp.native_pixels_per_point = Some(scale);
+            vp.focused = Some(true);
+        }
+        let ctx = self.msg_ctx.clone();
+        let launcher = &mut self.launcher;
+        let mut output = ctx.run_ui(raw, |ui| launcher.message_ui(ui.ctx()));
+        let renderer = self
+            .msg_renderer
+            .get_or_insert_with(|| egui_wgpu::Renderer::new(&gpu.device, gpu.format, egui_wgpu::RendererOptions::default()));
+        let mut textures = std::mem::take(&mut output.textures_delta);
+        for (id, deltas) in textures.set.drain() {
+            for delta in &deltas {
+                renderer.update_texture(&gpu.device, &gpu.queue, id, delta);
+            }
+        }
+        let to_free: Vec<egui::TextureId> = textures.free.drain().collect();
+        let frame = match win.surface.as_ref().map(|s| s.get_current_texture()) {
+            Some(wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t)) => t,
+            other => {
+                log::debug!("cannot acquire message box frame: {other:?}");
+                for id in &to_free {
+                    renderer.free_texture(id);
+                }
+                win.needs_reconfigure = true;
+                self.msg_redraw = true;
+                return;
+            }
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ppp = output.pixels_per_point;
+        let primitives = ctx.tessellate(output.shapes, ppp);
+        let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [pw, ph], pixels_per_point: ppp };
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let extra = renderer.update_buffers(&gpu.device, &gpu.queue, &mut encoder, &primitives, &screen);
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui-msgbox"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            renderer.render(&mut pass, &primitives, &screen);
+        }
+        for id in &to_free {
+            renderer.free_texture(id);
+        }
+        let wants_repaint = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|v| v.repaint_delay < Duration::from_secs(1));
+        if wants_repaint && !win.frame_pending {
+            let surf = win.shell.wl_surface();
+            surf.frame(&self.qh, surf.clone());
+            win.frame_pending = true;
+        }
+        gpu.queue.submit(extra.into_iter().chain(std::iter::once(encoder.finish())));
+        gpu.queue.present(frame);
+        // OK / close in the message box: update the dialog and drop the window
+        self.redraw = true;
+        self.sync_message_box();
+    }
+
+    /// The Run dialog is shown as a normal window when the compositor draws window frames.
+    fn run_as_window(&self) -> bool {
+        self.launcher.run_layout() && self.xdg_shell.is_some() && self.server_decorations
+    }
+
+    /// Loads the Kvantum theme and installs the KWin placement for the Run dialog window.
+    fn prepare_run_dialog(&mut self) {
+        if !self.launcher.run_layout() {
+            return;
+        }
+        if !self.kvantum_requested {
+            self.kvantum_requested = true;
+            let tx = self.msg_tx.clone();
+            std::thread::spawn(move || {
+                let k = crate::kvantum::Kvantum::load();
+                log::info!("kvantum theme for the Run dialog: {:?}", k.as_ref().map(|k| k.name.clone()));
+                let _ = tx.send(Msg::Kvantum(k.map(Box::new)));
+            });
+        }
+        if self.run_as_window() {
+            let script = crate::kwin::placement_script(&self.launcher.config);
+            if self.placement_applied.as_ref() != Some(&script) {
+                crate::kwin::install_run_window(&script);
+                self.placement_applied = Some(script);
+            }
+        }
     }
 
     fn schedule_repaint(&mut self, delay: Duration) {
@@ -878,7 +1154,7 @@ impl State {
             RequestData {
                 app_id: Some(APP_ID.to_string()),
                 seat_and_serial: self.seat.clone().map(|s| (s, self.last_serial)),
-                surface: Some(win.layer.wl_surface().clone()),
+                surface: Some(win.shell.wl_surface().clone()),
             },
         );
         self.pending_launch = Some(PendingLaunch { spec, started: Instant::now() });
@@ -928,6 +1204,11 @@ impl State {
             self.launcher.nav(nav);
             self.redraw = true;
             self.process_ui_events();
+            self.sync_message_box();
+            return;
+        }
+        if self.launcher.run.toplevel && self.launcher.run.error().is_some() {
+            // the message box is focused: only Enter / Escape (handled above) matter
             return;
         }
         let emods = egui_modifiers(&mods);
@@ -1002,17 +1283,17 @@ impl State {
     }
 
     fn is_our_surface(&self, surface: &wl_surface::WlSurface) -> bool {
-        self.window.as_ref().is_some_and(|w| w.layer.wl_surface() == surface)
+        self.window.as_ref().is_some_and(|w| w.shell.wl_surface() == surface)
     }
 
-    fn set_scale(&mut self, scale: f64, buffer_scale: i32) {
-        if let Some(win) = self.window.as_mut()
+    fn set_scale(&mut self, which: Which, scale: f64, buffer_scale: i32) {
+        if let Some(win) = self.win_mut(which)
             && ((win.scale - scale).abs() > f64::EPSILON || win.buffer_scale != buffer_scale)
         {
             win.scale = scale;
             win.buffer_scale = buffer_scale;
             win.needs_reconfigure = true;
-            self.redraw = true;
+            self.request_redraw(which);
         }
     }
 }
@@ -1094,16 +1375,25 @@ fn egui_key(sym: Keysym) -> Option<egui::Key> {
 impl CompositorHandler for State {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, factor: i32) {
         // Only used when the compositor lacks fractional scaling.
-        if self.is_our_surface(surface) && self.fractional_manager.is_none() {
-            self.set_scale(factor as f64, factor);
+        if let Some(which) = self.which_surface(surface)
+            && self.fractional_manager.is_none()
+        {
+            self.set_scale(which, factor as f64, factor);
         }
     }
 
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
 
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _: u32) {
+        if let Some(win) = self.msgbox.as_mut()
+            && win.shell.wl_surface() == surface
+        {
+            win.frame_pending = false;
+            self.msg_redraw = true;
+            return;
+        }
         if let Some(win) = self.window.as_mut()
-            && win.layer.wl_surface() == surface
+            && win.shell.wl_surface() == surface
         {
             win.frame_pending = false;
             self.redraw = true;
@@ -1126,7 +1416,7 @@ impl OutputHandler for State {
 
 impl LayerShellHandler for State {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
-        if self.window.as_ref().is_some_and(|w| &w.layer == layer) {
+        if self.window.as_ref().is_some_and(|w| matches!(&w.shell, Shell::Layer(l) if l == layer)) {
             self.hide();
         }
     }
@@ -1151,7 +1441,7 @@ impl LayerShellHandler for State {
             return;
         }
         let Some(win) = self.window.as_mut() else { return };
-        if &win.layer != layer {
+        if !matches!(&win.shell, Shell::Layer(l) if l == layer) {
             return;
         }
         let (w, h) = configure.new_size;
@@ -1159,13 +1449,47 @@ impl LayerShellHandler for State {
         win.height = if h == 0 { 1080 } else { h };
         win.configured = true;
         win.needs_reconfigure = true;
+        self.init_gpu_surface(Which::Main);
+    }
+}
 
+impl State {
+    fn win(&self, which: Which) -> Option<&Window> {
+        match which {
+            Which::Main => self.window.as_ref(),
+            Which::Message => self.msgbox.as_ref(),
+        }
+    }
+
+    fn win_mut(&mut self, which: Which) -> Option<&mut Window> {
+        match which {
+            Which::Main => self.window.as_mut(),
+            Which::Message => self.msgbox.as_mut(),
+        }
+    }
+
+    fn which_surface(&self, surface: &wl_surface::WlSurface) -> Option<Which> {
+        [Which::Main, Which::Message]
+            .into_iter()
+            .find(|w| self.win(*w).is_some_and(|win| win.shell.wl_surface() == surface))
+    }
+
+    fn request_redraw(&mut self, which: Which) {
+        match which {
+            Which::Main => self.redraw = true,
+            Which::Message => self.msg_redraw = true,
+        }
+    }
+
+    /// Creates the wgpu surface of a window after its first configure.
+    fn init_gpu_surface(&mut self, which: Which) {
+        let Some(win) = self.win(which) else { return };
         if win.surface.is_none() {
             let raw_display = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
                 NonNull::new(self.conn.backend().display_ptr() as *mut _).expect("display"),
             ));
             let raw_window = RawWindowHandle::Wayland(WaylandWindowHandle::new(
-                NonNull::new(win.layer.wl_surface().id().as_ptr() as *mut _).expect("surface"),
+                NonNull::new(win.shell.wl_surface().id().as_ptr() as *mut _).expect("surface"),
             ));
             let surface = unsafe {
                 self.instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
@@ -1180,7 +1504,7 @@ impl LayerShellHandler for State {
                         self.hide();
                         return;
                     }
-                    if let Some(win) = self.window.as_mut() {
+                    if let Some(win) = self.win_mut(which) {
                         win.surface = Some(s);
                     }
                 }
@@ -1191,7 +1515,38 @@ impl LayerShellHandler for State {
                 }
             }
         }
-        self.redraw = true;
+        self.request_redraw(which);
+    }
+}
+
+impl WindowHandler for State {
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &XdgWindow) {
+        match self.which_surface(window.wl_surface()) {
+            Some(Which::Main) => self.hide(),
+            Some(Which::Message) => {
+                self.launcher.run.close_error();
+                self.close_message_box();
+                self.redraw = true;
+            }
+            None => {}
+        }
+    }
+
+    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &XdgWindow, configure: WindowConfigure, _: u32) {
+        let Some(which) = self.which_surface(window.wl_surface()) else { return };
+        if configure.decoration_mode == DecorationMode::Client {
+            log::debug!("the compositor did not grant server-side decorations");
+        }
+        let Some(win) = self.win_mut(which) else { return };
+        let (w, h) = win.fixed_size.unwrap_or((
+            configure.new_size.0.map(|v| v.get()).unwrap_or(400),
+            configure.new_size.1.map(|v| v.get()).unwrap_or(200),
+        ));
+        win.width = w;
+        win.height = h;
+        win.configured = true;
+        win.needs_reconfigure = true;
+        self.init_gpu_surface(which);
     }
 }
 
@@ -1270,7 +1625,8 @@ impl KeyboardHandler for State {
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, surface: &wl_surface::WlSurface, _: u32) {
         if self.is_our_surface(surface) && self.keyboard_focus {
             self.keyboard_focus = false;
-            if self.launcher.config.close_on_focus_out && self.pending_launch.is_none() {
+            let message_box = self.msgbox.is_some() || self.launcher.run.error().is_some();
+            if self.launcher.config.close_on_focus_out && self.pending_launch.is_none() && !message_box {
                 self.hide();
             }
         }
@@ -1322,6 +1678,31 @@ impl PointerHandler for State {
             return;
         }
         for event in events {
+            if self.msgbox.as_ref().is_some_and(|w| w.shell.wl_surface() == &event.surface) {
+                let pos = egui::pos2(event.position.0 as f32, event.position.1 as f32);
+                let ev = match event.kind {
+                    PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => Some(egui::Event::PointerMoved(pos)),
+                    PointerEventKind::Leave { .. } => Some(egui::Event::PointerGone),
+                    PointerEventKind::Press { button: 0x110, .. } => Some(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: mods,
+                    }),
+                    PointerEventKind::Release { button: 0x110, .. } => Some(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: mods,
+                    }),
+                    _ => None,
+                };
+                if let Some(ev) = ev {
+                    self.msg_events.push(ev);
+                    self.msg_redraw = true;
+                }
+                continue;
+            }
             if !self.is_our_surface(&event.surface) {
                 continue;
             }
@@ -1419,9 +1800,9 @@ impl Dispatch<WpFractionalScaleV1, wl_surface::WlSurface> for State {
         _: &QueueHandle<Self>,
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
-            && state.is_our_surface(surface)
+            && let Some(which) = state.which_surface(surface)
         {
-            state.set_scale(scale as f64 / 120.0, 1);
+            state.set_scale(which, scale as f64 / 120.0, 1);
         }
     }
 }
@@ -1474,4 +1855,6 @@ delegate_keyboard!(State);
 delegate_pointer!(State);
 delegate_layer!(State);
 delegate_activation!(State);
+delegate_xdg_shell!(State);
+delegate_xdg_window!(State);
 delegate_registry!(State);

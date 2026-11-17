@@ -29,11 +29,13 @@ Press a hotkey, type a few letters, hit Enter. rlauncher shows up in the middle 
 
 ### Windows 7 Run dialog layout
 
-*Settings → Appearance → Layout → Windows 7 Run dialog* (or `layout = "run-dialog"` in the config) turns rlauncher into a recreation of the Windows 7 "Run" dialog, with an Aero glass frame (blurred on KDE). Type a command, path, URL, app name or query keyword and press Enter. Your **run history** is the drop-down list: it opens while you type (autocomplete), with the Down key or with the arrow. The last command is pre-filled, *Browse…* picks a file through the desktop's file chooser, and clicking the icon opens the settings. `run_position = "bottom-left"` (default) or `"center"`.
+*Settings → Appearance → Layout → Windows 7 Run dialog* (or `layout = "run-dialog"` in the config) turns rlauncher into a recreation of the Windows 7 "Run" dialog. Type a command, path, URL, app name or query keyword and press Enter. Your **run history** is the drop-down list: it opens while you type (autocomplete), with the Down key or with the arrow. The last command is pre-filled, *Browse…* picks a file through the desktop's file chooser, an unknown command shows a "cannot find" message box, and clicking the icon opens the settings.
 
-<img src="docs/run-dialog.png" alt="rlauncher as a Windows 7 Run dialog" width="440">
+The dialog is a normal window, so the compositor draws its frame. With [AeroThemePlasma](https://gitgud.io/wackyideas/aerothemeplasma) that is the real Aero frame (SMOD). The controls are drawn from your **Kvantum** theme when Qt apps use one, and the icons come from your icon theme, so it looks like a Qt dialog on your desktop. Without Kvantum it uses a classic Windows 7 look. On KWin a small KWin script places the window bottom left like Windows does (`run_position = "bottom-left"`, default) or centered (`"center"`). Compositors without server-side decorations get an overlay with a drawn Aero frame instead.
 
-The layout follows [ExecBin](https://gitgud.io/catpswin56/execbin); everything is drawn by rlauncher, no Windows resources are included.
+<img src="docs/run-dialog.png" alt="rlauncher as a Windows 7 Run dialog with AeroThemePlasma" width="440">
+
+The layout follows [ExecBin](https://gitgud.io/catpswin56/execbin). rlauncher includes no Windows resources; it uses the theme and icons installed on your system.
 
 ## Compatibility
 

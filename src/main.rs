@@ -5,6 +5,8 @@ mod fuzzy;
 mod hotkey;
 mod icons;
 mod ipc;
+mod kvantum;
+mod kwin;
 mod search;
 mod settings;
 mod theme;
