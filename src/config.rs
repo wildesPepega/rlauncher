@@ -59,6 +59,30 @@ pub struct Config {
     pub placeholder: String,
     /// The monitor the launcher opens on.
     pub monitor: Monitor,
+    /// Window layout: the Ulauncher-style launcher or a Windows 7 style "Run" dialog.
+    pub layout: Layout,
+    /// Where the Run dialog appears.
+    pub run_position: RunPosition,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Layout {
+    /// Search field with a list of results (Ulauncher style).
+    #[default]
+    Launcher,
+    /// A Windows 7 style "Run" dialog; the run history is the result list.
+    RunDialog,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunPosition {
+    /// Bottom left, above the panel, like on Windows.
+    #[default]
+    BottomLeft,
+    /// Horizontally centered, at `top_offset`.
+    Center,
 }
 
 /// Which monitor the launcher opens on.
@@ -101,6 +125,8 @@ impl Default for Config {
             font: String::new(),
             placeholder: "Search apps, commands…".into(),
             monitor: Monitor::Mouse,
+            layout: Layout::Launcher,
+            run_position: RunPosition::BottomLeft,
         }
     }
 }

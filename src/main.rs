@@ -9,7 +9,9 @@ mod search;
 mod settings;
 mod theme;
 mod ui;
+mod run;
 mod wayland;
+mod win7;
 
 use ipc::Command;
 

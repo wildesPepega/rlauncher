@@ -27,6 +27,14 @@ Press a hotkey, type a few letters, hit Enter. rlauncher shows up in the middle 
 |---|---|
 | <img src="docs/settings-queries.png" alt="Query editor"> | <img src="docs/settings-themes.png" alt="Theme picker"> |
 
+### Windows 7 Run dialog layout
+
+*Settings → Appearance → Layout → Windows 7 Run dialog* (or `layout = "run-dialog"` in the config) turns rlauncher into a recreation of the Windows 7 "Run" dialog, with an Aero glass frame (blurred on KDE). Type a command, path, URL, app name or query keyword and press Enter. Your **run history** is the drop-down list: it opens while you type (autocomplete), with the Down key or with the arrow. The last command is pre-filled, *Browse…* picks a file through the desktop's file chooser, and clicking the icon opens the settings. `run_position = "bottom-left"` (default) or `"center"`.
+
+<img src="docs/run-dialog.png" alt="rlauncher as a Windows 7 Run dialog" width="440">
+
+The layout follows [ExecBin](https://gitgud.io/catpswin56/execbin); everything is drawn by rlauncher, no Windows resources are included.
+
 ## Compatibility
 
 rlauncher needs a Wayland compositor that implements **wlr-layer-shell**.

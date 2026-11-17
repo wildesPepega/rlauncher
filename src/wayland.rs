@@ -47,6 +47,9 @@ use wayland_client::{
     globals::{GlobalList, registry_queue_init},
     protocol::{wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
+use wayland_protocols_plasma::blur::client::{
+    org_kde_kwin_blur::OrgKdeKwinBlur, org_kde_kwin_blur_manager::OrgKdeKwinBlurManager,
+};
 use wayland_protocols_plasma::output_order::v1::client::kde_output_order_v1::{self, KdeOutputOrderV1};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
@@ -109,6 +112,9 @@ struct Window {
     configured: bool,
     needs_reconfigure: bool,
     frame_pending: bool,
+    /// KDE blur behind the Run dialog's glass frame.
+    blur: Option<OrgKdeKwinBlur>,
+    blur_rects: Vec<egui::Rect>,
 }
 
 impl Window {
@@ -156,6 +162,7 @@ pub struct State {
     activation: Option<ActivationState>,
     fractional_manager: Option<WpFractionalScaleManagerV1>,
     viewporter: Option<WpViewporter>,
+    blur_manager: Option<OrgKdeKwinBlurManager>,
 
     seat: Option<wl_seat::WlSeat>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -212,6 +219,7 @@ pub fn run(listener: UnixListener, show_on_start: bool) -> anyhow::Result<()> {
     let fractional_manager = bind_optional::<WpFractionalScaleManagerV1>(&globals, &qh);
     let viewporter = bind_optional::<WpViewporter>(&globals, &qh);
     let output_order_global = bind_optional::<KdeOutputOrderV1>(&globals, &qh);
+    let blur_manager = bind_optional::<OrgKdeKwinBlurManager>(&globals, &qh);
 
     let display_ptr = NonNull::new(conn.backend().display_ptr() as *mut std::ffi::c_void)
         .context("null wayland display")?;
@@ -280,6 +288,7 @@ pub fn run(listener: UnixListener, show_on_start: bool) -> anyhow::Result<()> {
         activation,
         fractional_manager,
         viewporter,
+        blur_manager,
         seat: None,
         keyboard: None,
         pointer: None,
@@ -310,6 +319,7 @@ pub fn run(listener: UnixListener, show_on_start: bool) -> anyhow::Result<()> {
         exit: false,
     };
     state.launcher.setup(&state.egui_ctx);
+    state.launcher.run.blur_available = state.blur_manager.is_some();
     state.rescan_apps();
     // Live updates of the app list while running (and while the launcher is open).
     let tx = state.msg_tx.clone();
@@ -538,7 +548,8 @@ impl State {
             self.layer_shell
                 .create_layer_surface(&self.qh, surface, Layer::Overlay, Some("rlauncher"), output);
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_exclusive_zone(-1);
+        // The Run dialog sits above the panels (like on Windows), the launcher covers everything.
+        layer.set_exclusive_zone(if self.launcher.run_layout() { 0 } else { -1 });
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         layer.set_size(0, 0);
         layer.commit();
@@ -555,6 +566,8 @@ impl State {
             configured: false,
             needs_reconfigure: true,
             frame_pending: false,
+            blur: None,
+            blur_rects: Vec::new(),
         });
         self.egui_events.clear();
         self.keyboard_focus = false;
@@ -575,6 +588,9 @@ impl State {
             }
             if let Some(v) = win.viewport.take() {
                 v.destroy();
+            }
+            if let Some(b) = win.blur.take() {
+                b.release();
             }
             drop(win);
             let _ = self.conn.flush();
@@ -765,6 +781,31 @@ impl State {
             gpu.renderer.free_texture(id);
         }
 
+        // Blur behind the glass frame (applied with the commit done by present).
+        let glass: &[egui::Rect] = if self.launcher.run_layout() && !self.launcher.in_settings() {
+            &self.launcher.run.glass
+        } else {
+            &[]
+        };
+        if glass != win.blur_rects.as_slice()
+            && let Some(manager) = &self.blur_manager
+        {
+            win.blur_rects = glass.to_vec();
+            if glass.is_empty() {
+                if let Some(b) = win.blur.take() {
+                    b.release();
+                    manager.unset(win.layer.wl_surface());
+                }
+            } else if let Ok(region) = smithay_client_toolkit::compositor::Region::new(&self.compositor) {
+                for r in glass {
+                    add_rounded(&region, *r, 6.0);
+                }
+                let blur = win.blur.get_or_insert_with(|| manager.create(win.layer.wl_surface(), &self.qh, ()));
+                blur.set_region(Some(region.wl_region()));
+                blur.commit();
+            }
+        }
+
         // Ask for a frame callback before presenting (presenting commits the surface).
         let animating = repaint_delay.is_zero();
         if animating && !win.frame_pending {
@@ -804,8 +845,22 @@ impl State {
                     self.launcher.open_settings(None);
                     self.redraw = true;
                 }
+                UiEvent::Browse => self.browse(),
             }
         }
+    }
+
+    /// "Browse…": hides the dialog, lets the user pick a file with the portal's file chooser
+    /// and opens the dialog again with the chosen path (or the old text when cancelled).
+    fn browse(&mut self) {
+        let previous = self.launcher.run.text.clone();
+        self.hide();
+        let tx = self.msg_tx.clone();
+        std::thread::spawn(move || {
+            let chosen = pick_file();
+            let text = chosen.map(|p| crate::run::quote_path(&p)).unwrap_or(previous);
+            let _ = tx.send(Msg::Command(Command::Show, Some(text)));
+        });
     }
 
     /// Launches with an XDG activation token so the new window gets focus.
@@ -960,6 +1015,43 @@ impl State {
             self.redraw = true;
         }
     }
+}
+
+/// Adds a rect with rounded corners to a region, approximated by one-pixel rows.
+fn add_rounded(region: &smithay_client_toolkit::compositor::Region, r: egui::Rect, radius: f32) {
+    let (x, y, w, h) = (r.left() as i32, r.top() as i32, r.width() as i32, r.height() as i32);
+    let rad = radius as i32;
+    region.add(x, y + rad, w, (h - 2 * rad).max(0));
+    for i in 0..rad {
+        let d = (rad - i) as f32 - 0.5;
+        let inset = (radius - (radius * radius - d * d).max(0.0).sqrt()).round() as i32;
+        region.add(x + inset, y + i, w - 2 * inset, 1);
+        region.add(x + inset, y + h - 1 - i, w - 2 * inset, 1);
+    }
+}
+
+#[cfg(feature = "portal")]
+fn pick_file() -> Option<String> {
+    use ashpd::desktop::file_chooser::SelectedFiles;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+    let uri = rt.block_on(async {
+        let request = SelectedFiles::open_file().title("Browse").modal(true).multiple(false).send().await;
+        let files = match request.and_then(|r| r.response()) {
+            Ok(f) => f,
+            Err(e) => {
+                log::info!("file chooser: {e}");
+                return None;
+            }
+        };
+        files.uris().first().map(|u| u.to_string())
+    })?;
+    crate::run::uri_to_path(&uri)
+}
+
+#[cfg(not(feature = "portal"))]
+fn pick_file() -> Option<String> {
+    log::warn!("built without portal support, Browse… is not available");
+    None
 }
 
 fn egui_modifiers(m: &Modifiers) -> egui::Modifiers {
@@ -1336,6 +1428,14 @@ impl Dispatch<WpFractionalScaleV1, wl_surface::WlSurface> for State {
 
 impl Dispatch<wl_buffer::WlBuffer, ()> for State {
     fn event(_: &mut Self, _: &wl_buffer::WlBuffer, _: wl_buffer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<OrgKdeKwinBlurManager, ()> for State {
+    fn event(_: &mut Self, _: &OrgKdeKwinBlurManager, _: <OrgKdeKwinBlurManager as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<OrgKdeKwinBlur, ()> for State {
+    fn event(_: &mut Self, _: &OrgKdeKwinBlur, _: <OrgKdeKwinBlur as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 
 impl Dispatch<KdeOutputOrderV1, ()> for State {

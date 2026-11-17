@@ -245,7 +245,7 @@ fn shortcut_item(
     }
 }
 
-fn shortcut_spec(s: &Shortcut, arg: Option<&str>) -> LaunchSpec {
+pub fn shortcut_spec(s: &Shortcut, arg: Option<&str>) -> LaunchSpec {
     let cmd = s.cmd.trim();
     if s.is_url() {
         return LaunchSpec::Open(match arg {

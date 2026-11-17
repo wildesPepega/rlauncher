@@ -392,6 +392,26 @@ impl Settings {
     }
 
     fn appearance_ui(&mut self, ui: &mut egui::Ui, t: &Theme, actions: &mut Vec<SettingsAction>) {
+        section(ui, t, "Layout");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.config.layout, config::Layout::Launcher, "Launcher (Ulauncher style)");
+            ui.radio_value(&mut self.config.layout, config::Layout::RunDialog, "Windows 7 Run dialog");
+        });
+        if self.config.layout == config::Layout::RunDialog {
+            ui.horizontal(|ui| {
+                ui.label("Position:");
+                ui.radio_value(&mut self.config.run_position, config::RunPosition::BottomLeft, "Bottom left (like Windows)");
+                ui.radio_value(&mut self.config.run_position, config::RunPosition::Center, "Centered");
+            });
+            ui.label(
+                RichText::new(
+                    "Type a command, path, URL, app name or query keyword. Your run history is the drop-down \
+                     list (Down key or the arrow). Click the icon in the dialog to open these settings.",
+                )
+                .color(t.item_text),
+            );
+        }
+
         section(ui, t, "Theme");
         if self.previews.is_none() {
             self.previews = Some(self.themes.iter().map(|th| Theme::load(&th.name)).collect());

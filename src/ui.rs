@@ -7,12 +7,13 @@ use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Vec2, pos2, vec2};
 
 use crate::apps::{App, LaunchSpec};
-use crate::config::{Config, Shortcut, Stats};
+use crate::config::{Config, Layout, Shortcut, Stats};
 use crate::hotkey::{HotkeyCmd, HotkeyStatus};
 use crate::icons::{IconLoader, LoadedIcon};
 use crate::search::{self, Action, ResultItem};
 use crate::settings::{Settings, SettingsAction};
 use crate::theme::Theme;
+use crate::win7::RunDialog;
 
 /// Requests from the UI to the windowing layer.
 #[derive(Debug)]
@@ -22,6 +23,8 @@ pub enum UiEvent {
     Copy(String),
     Hotkey(HotkeyCmd),
     OpenSettings,
+    /// "Browse…" in the Run dialog: pick a file with the portal file chooser.
+    Browse,
 }
 
 /// Navigation keys handled by the launcher itself (not by the text field).
@@ -70,6 +73,8 @@ pub struct Launcher {
 
     settings: Option<Settings>,
     hotkey_status: Arc<Mutex<HotkeyStatus>>,
+    /// State of the Windows 7 style Run dialog layout.
+    pub run: RunDialog,
 }
 
 const PADDING: f32 = 12.0;
@@ -105,6 +110,7 @@ impl Launcher {
             events: Vec::new(),
             settings: None,
             hotkey_status: Arc::default(),
+            run: RunDialog::default(),
         }
     }
 
@@ -188,7 +194,14 @@ impl Launcher {
         self.apply_style(ctx);
     }
 
+    pub fn run_layout(&self) -> bool {
+        self.config.layout == Layout::RunDialog
+    }
+
     pub fn reset(&mut self) {
+        if self.run_layout() {
+            self.run.reset();
+        }
         self.query.clear();
         self.results.clear();
         self.selected = 0;
@@ -327,6 +340,10 @@ impl Launcher {
     }
 
     pub fn nav(&mut self, key: NavKey) {
+        if self.run_layout() {
+            self.run.nav(key, &self.apps, &self.shortcuts, &mut self.events);
+            return;
+        }
         let n = self.results.len();
         if matches!(key, NavKey::Up | NavKey::Down | NavKey::PageUp | NavKey::PageDown) {
             self.manual_selection = true;
@@ -363,6 +380,10 @@ impl Launcher {
     }
 
     pub fn set_query(&mut self, q: String) {
+        if self.run_layout() {
+            self.run.set_text(q);
+            return;
+        }
         self.query = q;
         self.cursor_to_end = true;
         self.refresh(true);
@@ -397,6 +418,10 @@ impl Launcher {
     pub fn ui(&mut self, ctx: &egui::Context) {
         if self.settings.is_some() {
             self.settings_page(ctx);
+            return;
+        }
+        if self.run_layout() {
+            self.run.ui(ctx, &self.config, &self.apps, &self.shortcuts, &mut self.events);
             return;
         }
         let screen = ctx.content_rect();
@@ -797,5 +822,23 @@ fn install_fonts(ctx: &egui::Context, configured: &str) {
             Err(e) => log::warn!("cannot read font {path}: {e}"),
         }
     }
+    // The Run dialog uses Segoe UI when it is installed, like Windows 7.
+    let segoe = std::process::Command::new("fc-match")
+        .args(["-f", "%{family}\n%{file}", "Segoe UI:style=Regular"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .and_then(|out| {
+            let (family, file) = out.split_once('\n')?;
+            family.contains("Segoe UI").then(|| file.trim().to_string())
+        })
+        .and_then(|file| std::fs::read(file).ok());
+    let mut win7 = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    if let Some(bytes) = segoe {
+        fonts.font_data.insert("segoe".into(), Arc::new(egui::FontData::from_owned(bytes)));
+        win7.insert(0, "segoe".into());
+    }
+    fonts.families.insert(egui::FontFamily::Name(crate::win7::FONT.into()), win7);
     ctx.set_fonts(fonts);
 }
