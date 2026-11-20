@@ -15,9 +15,10 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 
 use crate::apps::App;
-use crate::config::{Config, RunPosition, Shortcut};
+use crate::config::{Config, RunPosition, Shortcut, Stats};
 use crate::kvantum::Kvantum;
 use crate::run;
+use crate::search::{self, Action, ResultItem};
 use crate::ui::{NavKey, UiEvent};
 
 /// Font family registered by the launcher (Segoe UI when installed).
@@ -32,6 +33,57 @@ const CAPTION: f32 = 30.0;
 const FONT_SIZE: f32 = 12.0;
 const ROW_H: f32 = 17.0;
 const MAX_ROWS: usize = 8;
+/// Results shown while typing.
+const TYPED_ROWS: usize = 3;
+
+/// A line of the drop-down: a history entry or a search result.
+#[derive(Clone)]
+struct Row {
+    /// Shown in the list.
+    label: String,
+    /// Put into the input field when the row is chosen.
+    text: String,
+    /// What a search result does; history entries are resolved from `text`.
+    action: Option<Action>,
+}
+
+impl Row {
+    fn history(h: &str) -> Row {
+        Row { label: h.to_string(), text: h.to_string(), action: None }
+    }
+
+    fn from_result(item: &ResultItem, typed: &str, shortcuts: &[Shortcut]) -> Row {
+        let typed = typed.trim();
+        let text = if item.key.starts_with("app:") {
+            item.title.clone()
+        } else if let Action::SetQuery(q) = &item.action {
+            q.clone()
+        } else if let Action::Copy(v) = &item.action {
+            v.clone()
+        } else if let Some(path) = item.key.strip_prefix("file:") {
+            path.to_string()
+        } else if let Some(id) = item.key.strip_prefix("shortcut:")
+            && let Some(sc) = shortcuts.iter().find(|s| s.id == id)
+            && !typed.to_lowercase().starts_with(&sc.keyword.to_lowercase())
+        {
+            sc.keyword.clone()
+        } else {
+            typed.to_string()
+        };
+        let label = if item.key == "calc" { format!("= {}", item.title) } else { item.title.clone() };
+        Row { label, text, action: Some(item.action.clone()) }
+    }
+}
+
+/// `typed` + the rest of `full`, if `full` starts with `typed` (ignoring case) and is longer.
+fn inline_completion(typed: &str, full: &str) -> Option<String> {
+    let n = typed.chars().count();
+    if n == 0 || full.chars().count() <= n {
+        return None;
+    }
+    let head: String = full.chars().take(n).collect();
+    (head.to_lowercase() == typed.to_lowercase()).then(|| format!("{typed}{}", full.chars().skip(n).collect::<String>()))
+}
 
 const TEXT: Color32 = Color32::BLACK;
 const HIGHLIGHT: Color32 = Color32::from_rgb(0x33, 0x99, 0xff);
@@ -46,7 +98,9 @@ pub struct RunDialog {
     pub text: String,
     history: Vec<String>,
     /// Entries of the drop-down.
-    list: Vec<String>,
+    list: Vec<Row>,
+    /// The completed part of the input is selected from this char index on (inline autocomplete).
+    inline_from: Option<usize>,
     dropdown: bool,
     selected: Option<usize>,
     scroll: usize,
@@ -83,8 +137,16 @@ impl RunDialog {
         self.typed = self.text.clone();
         self.select_all = true;
         self.close_dropdown();
+        self.clear_list();
         self.error = None;
         self.last_pointer = None;
+    }
+
+    fn clear_list(&mut self) {
+        self.list.clear();
+        self.selected = None;
+        self.scroll = 0;
+        self.inline_from = None;
     }
 
     pub fn set_text(&mut self, text: String) {
@@ -93,34 +155,61 @@ impl RunDialog {
         self.cursor_to_end = true;
         self.select_all = false;
         self.close_dropdown();
+        self.clear_list();
     }
 
+    /// Hides the list; the chosen row stays chosen while the text matches it.
     fn close_dropdown(&mut self) {
         self.dropdown = false;
-        self.selected = None;
-        self.scroll = 0;
     }
 
-    /// The text was edited by the user: show matching history entries (autocomplete).
-    fn typed_changed(&mut self) {
+    /// The text was edited by the user: history matches and the best search results, with
+    /// the best one completed inline (like the launcher's preselected first result).
+    fn typed_changed(&mut self, ctx: &search::Context) {
+        // Deleting (e.g. Backspace removing the completion) must not complete again.
+        let deleted = self.text.chars().count() <= self.typed.chars().count() && self.typed.starts_with(&self.text);
         self.typed = self.text.clone();
-        self.list = run::matches(&self.history, &self.text).into_iter().map(String::from).collect();
-        self.dropdown = !self.text.trim().is_empty() && !self.list.is_empty();
-        self.selected = None;
-        self.scroll = 0;
+        self.clear_list();
+        if self.typed.trim().is_empty() {
+            self.dropdown = false;
+            return;
+        }
+        let mut rows: Vec<Row> = run::matches(&self.history, &self.typed).into_iter().map(Row::history).collect();
+        rows.truncate(TYPED_ROWS);
+        for item in search::search(&self.typed, ctx) {
+            if rows.len() >= TYPED_ROWS {
+                break;
+            }
+            let row = Row::from_result(&item, &self.typed, ctx.shortcuts);
+            if !rows.iter().any(|r| r.text.eq_ignore_ascii_case(&row.text) || r.label == row.label) {
+                rows.push(row);
+            }
+        }
+        self.list = rows;
+        self.dropdown = !self.list.is_empty();
+        if !deleted
+            && let Some(first) = self.list.first()
+            && let Some(completed) = inline_completion(&self.typed, &first.text)
+        {
+            self.inline_from = Some(self.typed.chars().count());
+            self.text = completed;
+            self.selected = Some(0);
+        }
     }
 
     fn open_full_history(&mut self) {
-        self.list = self.history.clone();
+        self.list = self.history.iter().map(|h| Row::history(h)).collect();
         self.dropdown = !self.list.is_empty();
         self.selected = None;
         self.scroll = 0;
+        self.inline_from = None;
     }
 
     fn select(&mut self, index: Option<usize>) {
         self.selected = index;
+        self.inline_from = None;
         match index.and_then(|i| self.list.get(i)) {
-            Some(entry) => self.text = entry.clone(),
+            Some(entry) => self.text = entry.text.clone(),
             None => self.text = self.typed.clone(),
         }
         self.cursor_to_end = true;
@@ -155,7 +244,7 @@ impl RunDialog {
                     if matching.is_empty() || self.text.trim().is_empty() {
                         self.open_full_history();
                     } else {
-                        self.list = matching.into_iter().map(String::from).collect();
+                        self.list = matching.into_iter().map(Row::history).collect();
                         self.dropdown = true;
                     }
                     if self.dropdown {
@@ -175,6 +264,11 @@ impl RunDialog {
                 });
             }
             NavKey::Enter { .. } => self.run(apps, shortcuts, events),
+            // Tab accepts the inline completion
+            NavKey::Complete => {
+                self.typed = self.text.clone();
+                self.cursor_to_end = true;
+            }
             _ => {}
         }
     }
@@ -185,12 +279,36 @@ impl RunDialog {
         if text.is_empty() {
             return;
         }
-        match run::resolve(&text, apps, shortcuts) {
-            Some(spec) => {
-                run::push_history(&mut self.history, &text);
+        // the chosen row, as long as the input still shows it
+        let chosen = self
+            .selected
+            .and_then(|i| self.list.get(i))
+            .filter(|r| r.text.trim().eq_ignore_ascii_case(&text))
+            .cloned();
+        let row = match chosen {
+            Some(row) => Some(row),
+            // what was typed works as it is
+            None if run::resolve(&text, apps, shortcuts).is_some() => None,
+            // otherwise the best match, like Enter in the launcher
+            None => self.list.iter().find(|r| r.action.is_some()).cloned(),
+        };
+        match row.and_then(|r| r.action.map(|a| (r.text, a))) {
+            Some((row_text, Action::Launch(spec))) => {
+                run::push_history(&mut self.history, &row_text);
                 events.push(UiEvent::Launch(spec));
             }
-            None => self.error = Some(text),
+            Some((_, Action::Copy(value))) => {
+                events.push(UiEvent::Copy(value));
+                events.push(UiEvent::Hide);
+            }
+            Some((_, Action::SetQuery(q))) => self.set_text(q),
+            None => match run::resolve(&text, apps, shortcuts) {
+                Some(spec) => {
+                    run::push_history(&mut self.history, &text);
+                    events.push(UiEvent::Launch(spec));
+                }
+                None => self.error = Some(text),
+            },
         }
     }
 
@@ -235,6 +353,7 @@ impl RunDialog {
         config: &Config,
         apps: &[App],
         shortcuts: &[Shortcut],
+        stats: &Stats,
         events: &mut Vec<UiEvent>,
     ) {
         let (kv, pal, tex) = self.take_look(ctx, false);
@@ -327,20 +446,26 @@ impl RunDialog {
                     .min_size(edit_rect.size())
                     .desired_width(edit_rect.width());
                 let mut output = ui.scope_builder(egui::UiBuilder::new().max_rect(edit_rect), |ui| edit.show(ui)).inner;
-                if self.select_all || self.cursor_to_end {
+                if output.response.changed() {
+                    let search_ctx = search::Context { apps, shortcuts, stats, config };
+                    self.typed_changed(&search_ctx);
+                }
+                if self.select_all || self.cursor_to_end || self.inline_from.is_some() {
+                    use egui::text::{CCursor, CCursorRange};
                     let n = self.text.chars().count();
                     let range = if self.select_all {
-                        egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(n))
+                        CCursorRange::two(CCursor::new(0), CCursor::new(n))
+                    } else if let Some(from) = self.inline_from.take() {
+                        // the completed rest is selected, typing replaces it
+                        CCursorRange::two(CCursor::new(from), CCursor::new(n))
                     } else {
-                        egui::text::CCursorRange::one(egui::text::CCursor::new(n))
+                        CCursorRange::one(CCursor::new(n))
                     };
                     output.state.cursor.set_char_range(Some(range));
                     output.state.store(ui.ctx(), id);
                     self.select_all = false;
                     self.cursor_to_end = false;
-                }
-                if output.response.changed() {
-                    self.typed_changed();
+                    ui.ctx().request_repaint();
                 }
                 if !blocked {
                     output.response.request_focus();
@@ -483,13 +608,13 @@ impl RunDialog {
             }
             let sel = self.selected == Some(i);
             let color = if sel { look.selected_row(ui.painter(), r) } else { pal.edit_text };
-            let g = ui.painter().layout_no_wrap(self.list[i].clone(), font(), color);
+            let g = ui.painter().layout_no_wrap(self.list[i].label.clone(), font(), color);
             let clip = ui.painter().with_clip_rect(r.shrink2(vec2(3.0, 0.0)));
             clip.galley(pos2(r.left() + 3.0, r.center().y - g.size().y / 2.0), g, color);
         }
         if let Some(i) = clicked {
+            // like Windows: a click puts the entry into the input field (Enter runs it)
             self.select(Some(i));
-            self.typed = self.text.clone();
             self.close_dropdown();
         }
         rect
@@ -911,4 +1036,47 @@ fn overlay_message_box(
     let close = close_button(ui, outer, "msgbox-close").clicked();
     let ok = message_client(ui, client, text, look, icon);
     (outer, close || ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_completion_keeps_the_typed_case() {
+        assert_eq!(inline_completion("fire", "Firefox").as_deref(), Some("firefox"));
+        assert_eq!(inline_completion("Ka", "kate ~/notes.txt").as_deref(), Some("Kate ~/notes.txt"));
+        assert_eq!(inline_completion("firefox", "Firefox"), None);
+        assert_eq!(inline_completion("fx", "Firefox"), None);
+        assert_eq!(inline_completion("", "Firefox"), None);
+    }
+
+    #[test]
+    fn results_put_runnable_text_into_the_input() {
+        let shortcuts = vec![Shortcut {
+            id: "r".into(),
+            name: "Reboot".into(),
+            keyword: "reboot".into(),
+            cmd: "systemctl reboot".into(),
+            icon: None,
+            is_default_search: false,
+            run_without_argument: true,
+            added: 0.0,
+        }];
+        let item = |key: &str, title: &str, action: Action| ResultItem {
+            key: key.into(),
+            title: title.into(),
+            highlight: Vec::new(),
+            description: String::new(),
+            icon: None,
+            action,
+            alt_action: None,
+            record: true,
+        };
+        let open = || Action::Launch(crate::apps::LaunchSpec::Open(String::new()));
+        assert_eq!(Row::from_result(&item("app:firefox.desktop", "Firefox", open()), "fi", &shortcuts).text, "Firefox");
+        assert_eq!(Row::from_result(&item("shortcut:r", "Reboot", open()), "reb", &shortcuts).text, "reboot");
+        let calc = Row::from_result(&item("calc", "4", Action::Copy("4".into())), "2+2", &shortcuts);
+        assert_eq!((calc.label.as_str(), calc.text.as_str()), ("= 4", "4"));
+    }
 }

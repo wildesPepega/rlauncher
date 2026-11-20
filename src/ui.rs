@@ -431,7 +431,7 @@ impl Launcher {
         if self.run_layout() {
             self.run.run_icon = self.icon_texture(ctx, "system-run@32").map(|t| t.id());
             self.run.error_icon = self.icon_texture(ctx, "dialog-error@32").map(|t| t.id());
-            self.run.ui(ctx, &self.config, &self.apps, &self.shortcuts, &mut self.events);
+            self.run.ui(ctx, &self.config, &self.apps, &self.shortcuts, &self.stats, &mut self.events);
             return;
         }
         let screen = ctx.content_rect();
